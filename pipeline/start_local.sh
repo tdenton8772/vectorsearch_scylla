@@ -13,7 +13,7 @@ if ! docker info > /dev/null 2>&1; then
 fi
 
 # Start Kafka infrastructure
-echo "📦 Starting Kafka, Zookeeper, and Redis..."
+echo "📦 Starting Kafka, Zookeeper, and Kafka UI..."
 docker-compose up -d
 
 # Wait for Kafka to be ready
@@ -36,7 +36,6 @@ echo ""
 echo "🌐 Services:"
 echo "  - Kafka broker: localhost:9092"
 echo "  - Kafka UI: http://localhost:8080"
-echo "  - Redis: localhost:6379"
 echo ""
 echo "📝 Next steps:"
 echo "  1. Start producer: python pipeline/kafka_producer.py --fleet-config pipeline/fleet_config.json --interval 10"

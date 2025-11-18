@@ -18,7 +18,7 @@ This system demonstrates how ScyllaDB's vector search capabilities enable intell
 │
 ├── pipeline/               # Data pipeline (Phase 2 & 3)
 │   ├── kafka_producer.py   # Device simulators → Kafka
-│   ├── kafka_consumer.py   # Kafka → Redis → Ollama → ScyllaDB
+│   ├── kafka_consumer.py   # Kafka → ScyllaDB Buffer → Ollama → ScyllaDB
 │   ├── build_profiles.py   # Build device fingerprints
 │   ├── detect_anomalies_rules.py  # Method 1: Rules-based detection
 │   ├── detect_anomalies.py        # Method 2: Profile similarity
