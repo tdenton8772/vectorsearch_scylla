@@ -10,10 +10,10 @@
 ## System Architecture
 
 ```
-Device Simulators → Kafka → Consumer → [Redis] → Ollama → ScyllaDB → Dashboard
-                                          ↓                      ↓
-                                     Aggregation           Profile/Detect
-                                                          Anomalies
+Device Simulators → Kafka → Consumer → ScyllaDB Buffer → Ollama → ScyllaDB → Dashboard
+                                              ↓                         ↓
+                                         Aggregation              Profile/Detect
+                                                                  Anomalies
 ```
 
 ## Step-by-Step Setup
@@ -23,7 +23,7 @@ Device Simulators → Kafka → Consumer → [Redis] → Ollama → ScyllaDB →
 cd /Users/tdenton/Development/reinvent_demo
 ./pipeline/start_local.sh
 ```
-**Starts**: Kafka, Zookeeper, Redis, Kafka UI (http://localhost:8080)
+**Starts**: Kafka, Zookeeper, Kafka UI (http://localhost:8080)
 
 ### 2. Start Producer (Terminal 2)
 ```bash
@@ -42,9 +42,9 @@ python pipeline/kafka_producer.py \
 
 ### 3. Start Consumer (Terminal 3)
 ```bash
-python pipeline/kafka_consumer.py --aggregation-window 20
+python pipeline/kafka_consumer.py --aggregation-window 60
 ```
-**Does**: Aggregates metrics every 20s → Generates embeddings → Writes to ScyllaDB
+**Does**: Aggregates metrics in ScyllaDB buffer (60s) → Generates embeddings → Writes snapshots
 
 ### 4. Build Device Profiles (Once)
 After devices have run for ~5+ minutes:
@@ -131,7 +131,7 @@ python pipeline/build_profiles.py --devices RTU-001 CH-001
 - `--anomaly-devices`: Device IDs that should exhibit anomalies
 
 ### Consumer
-- `--aggregation-window`: Seconds to aggregate metrics (default: 20)
+- `--aggregation-window`: Seconds to aggregate metrics (default: 60)
 
 ### Profile Builder
 - `--days-back`: Days of history to use (default: 1)
@@ -148,7 +148,7 @@ python pipeline/build_profiles.py --devices RTU-001 CH-001
 ### No snapshots in dashboard
 - Check consumer is running: `ps aux | grep kafka_consumer`
 - Verify consumer logs show embeddings being generated
-- Check Redis: `docker exec -it redis redis-cli KEYS '*'`
+- Check ScyllaDB buffer: Query `metric_aggregation_buffer` table
 
 ### Anomaly detection finds no profiles
 ```bash
@@ -171,7 +171,7 @@ docker-compose -f pipeline/docker-compose.yml down
 
 - **Kafka UI**: http://localhost:8080
 - **Dashboard**: http://localhost:8050
-- **Redis**: `docker exec -it redis redis-cli`
+- **ScyllaDB**: Query tables directly via Python scripts
 
 ## Stop Everything
 
@@ -205,8 +205,8 @@ docker-compose -f pipeline/docker-compose.yml down
 # Quick test cycle
 ./pipeline/start_local.sh
 python pipeline/kafka_producer.py --devices RTU-001:rooftop_unit --interval 10 &
-python pipeline/kafka_consumer.py --aggregation-window 20 &
-sleep 60
+python pipeline/kafka_consumer.py --aggregation-window 60 &
+sleep 120  # Wait for aggregation window
 python pipeline/build_profiles.py
 python pipeline/detect_anomalies.py
 ```

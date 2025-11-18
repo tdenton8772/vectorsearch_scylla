@@ -22,7 +22,6 @@ This starts:
 - Kafka broker (localhost:9092)
 - Zookeeper (localhost:2181)
 - Kafka UI (http://localhost:8080)
-- Redis (localhost:6379)
 
 ### 2. Install Python Dependencies
 
@@ -55,21 +54,21 @@ Open http://localhost:8080 and navigate to Topics → iot-metrics
 
 **Single consumer (for testing):**
 ```bash
-python pipeline/kafka_consumer.py --aggregation-window 20
+python pipeline/kafka_consumer.py --aggregation-window 60
 ```
 
 **Horizontal scaling (multiple consumers, same group):**
 ```bash
 # Terminal 1
-python pipeline/kafka_consumer.py --group-id iot-group --aggregation-window 20
+python pipeline/kafka_consumer.py --group-id iot-group --aggregation-window 60
 
 # Terminal 2 (will auto-balance partitions with Terminal 1)
-python pipeline/kafka_consumer.py --group-id iot-group --aggregation-window 20
+python pipeline/kafka_consumer.py --group-id iot-group --aggregation-window 60
 ```
 
 The consumer will:
 - Read individual metrics from Kafka
-- Aggregate by device using Redis (20-second windows for testing)
+- Aggregate by device using ScyllaDB buffer (60-second windows)
 - Generate embeddings with Ollama
 - Write raw metrics to ScyllaDB `device_metrics_raw`
 - Write aggregated snapshots to ScyllaDB `device_state_snapshots`
@@ -125,7 +124,7 @@ docker-compose down
 
 **Kafka won't start**:
 - Ensure Docker Desktop is running
-- Check ports 9092, 2181, 8080, 6379 are not in use
+- Check ports 9092, 2181, 8080 are not in use
 - View logs: `docker-compose logs kafka`
 
 **Producer connection errors**:
@@ -139,7 +138,10 @@ docker-compose down
 
 ## Next Steps
 
-- [ ] Create Kafka consumer to aggregate device state
-- [ ] Build embedding service using Ollama
-- [ ] Design ScyllaDB schema
-- [ ] Create ScyllaDB writer
+- [x] Create Kafka consumer to aggregate device state
+- [x] Build embedding service using Ollama
+- [x] Design ScyllaDB schema
+- [x] Create ScyllaDB writer
+- [x] Build device profiles
+- [x] Implement anomaly detection (3 methods)
+- [x] Create real-time dashboard
