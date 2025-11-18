@@ -18,19 +18,44 @@ Device Simulators → Kafka → Consumer → ScyllaDB Buffer → Ollama → Scyl
 
 ## Step-by-Step Setup
 
-### 1. Start Infrastructure (Terminal 1)
+### Quick Start (Automated)
+
+**Start everything at once:**
+```bash
+cd /Users/tdenton/Development/reinvent_demo
+./pipeline/start_pipeline.sh
+```
+This script will:
+1. Start Kafka infrastructure
+2. Start device simulators (producer)
+3. Start metric aggregator (consumer)
+4. Wait 90s and build device profiles
+5. Start continuous anomaly detection
+6. Start dashboard
+
+**Access**: 
+- Dashboard: http://localhost:8050
+- Kafka UI: http://localhost:8080
+
+**Stop everything:**
+```bash
+./pipeline/stop_pipeline.sh
+```
+
+### Manual Setup (Step-by-Step)
+
+#### 1. Start Infrastructure (Terminal 1)
 ```bash
 cd /Users/tdenton/Development/reinvent_demo
 ./pipeline/start_local.sh
 ```
 **Starts**: Kafka, Zookeeper, Kafka UI (http://localhost:8080)
 
-### 2. Start Producer (Terminal 2)
+#### 2. Start Producer (Terminal 2)
 ```bash
 # Normal operation (all devices)
 python pipeline/kafka_producer.py \
-    --devices RTU-001:rooftop_unit MAU-001:makeup_air_unit \
-              CH-001:chiller CT-001:cooling_tower AC-001:air_compressor \
+    --fleet-config pipeline/fleet_config.json \
     --interval 10
 
 # With anomaly injection
@@ -40,33 +65,33 @@ python pipeline/kafka_producer.py \
     --interval 10
 ```
 
-### 3. Start Consumer (Terminal 3)
+#### 3. Start Consumer (Terminal 3)
 ```bash
 python pipeline/kafka_consumer.py --aggregation-window 60
 ```
 **Does**: Aggregates metrics in ScyllaDB buffer (60s) → Generates embeddings → Writes snapshots
 
-### 4. Build Device Profiles (Once)
-After devices have run for ~5+ minutes:
+#### 4. Build Device Profiles (Once)
+After devices have run for ~90+ seconds:
 ```bash
 python pipeline/build_profiles.py
 ```
 **Creates**: Behavior fingerprints in `device_profiles` table
 
-### 5. Start Dashboard (Terminal 4)
+#### 5. Start Continuous Anomaly Detection (Terminal 4)
+```bash
+python pipeline/detect_anomalies_vector_search.py \
+    --continuous \
+    --only-new \
+    --hours-back 1
+```
+**Does**: Continuously checks new snapshots every 30s and marks anomalies
+
+#### 6. Start Dashboard (Terminal 5)
 ```bash
 python dashboard/app.py
 ```
 **Access**: http://localhost:8050
-
-### 6. Run Anomaly Detection
-```bash
-# One-time check
-python pipeline/detect_anomalies.py
-
-# Continuous monitoring
-python pipeline/detect_anomalies.py --continuous
-```
 
 ## Common Commands
 
@@ -175,15 +200,21 @@ docker-compose -f pipeline/docker-compose.yml down
 
 ## Stop Everything
 
+### Automated
+```bash
+./pipeline/stop_pipeline.sh
+```
+
+### Manual
 ```bash
 # Stop Python processes
 pkill -f kafka_producer.py
 pkill -f kafka_consumer.py
 pkill -f dashboard/app.py
-pkill -f detect_anomalies.py
+pkill -f detect_anomalies_vector_search.py
 
 # Stop Docker infrastructure
-docker-compose -f pipeline/docker-compose.yml down
+cd pipeline && docker-compose down
 ```
 
 ## Demo Workflow

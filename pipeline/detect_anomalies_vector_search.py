@@ -26,7 +26,8 @@ scylla_password = os.getenv('SCYLLA_PASSWORD')
 scylla_keyspace = os.getenv('SCYLLA_KEYSPACE', 'iot_monitoring')
 
 # Anomaly detection thresholds
-SIMILARITY_THRESHOLD = 0.85  # Below this = anomalous
+SIMILARITY_THRESHOLD = 0.60  # Below this = anomalous (very relaxed for normal operation)
+SIGMA_THRESHOLD = 5.0  # Z-score threshold for outliers (default was 3.0)
 
 
 def connect_scylla():
@@ -73,8 +74,12 @@ def get_device_profile(session, device_id: str) -> Optional[Dict]:
     }
 
 
-def get_recent_snapshots(session, device_id: str, hours_back: int = 1):
-    """Get recent snapshots for a device."""
+def get_recent_snapshots(session, device_id: str, hours_back: int = 1, only_new: bool = False):
+    """Get recent snapshots for a device.
+    
+    Args:
+        only_new: If True, only return snapshots with is_anomalous=false (not yet analyzed)
+    """
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours_back)
     
@@ -83,7 +88,7 @@ def get_recent_snapshots(session, device_id: str, hours_back: int = 1):
     # Query current day
     current_date = end_time.strftime('%Y-%m-%d')
     query = """
-        SELECT device_id, snapshot_time, embedding, metrics, is_anomalous
+        SELECT device_id, snapshot_time, embedding, metrics, is_anomalous, device_type
         FROM device_state_snapshots
         WHERE device_id = %s AND date = %s
         AND snapshot_time >= %s
@@ -98,6 +103,10 @@ def get_recent_snapshots(session, device_id: str, hours_back: int = 1):
         result = session.execute(query, (device_id, prev_date, start_time))
         snapshots.extend(result)
     
+    # Filter to only new (unmarked) snapshots if requested
+    if only_new:
+        snapshots = [s for s in snapshots if not s.is_anomalous]
+    
     return snapshots
 
 
@@ -106,39 +115,45 @@ def find_similar_snapshots_vector_search(
     query_embedding: List[float],
     device_id: str,
     date: str,
-    limit: int = 10
+    limit: int = 50  # Request more since we'll filter
 ) -> List[Dict]:
     """
     Use ScyllaDB Vector Search to find similar snapshots.
     
+    IMPORTANT: ScyllaDB ANN queries don't support WHERE clause filtering,
+    so we query all devices and filter by device_id afterward.
+    
     This performs an ANN (Approximate Nearest Neighbor) query using
     the vector index, demonstrating actual vector search capabilities.
     """
-    # Vector search query using ANN OF syntax
+    # Vector search query - NO WHERE clause (ScyllaDB ANN limitation)
+    # ScyllaDB's ANN query doesn't support WHERE filtering at all
+    # We query globally and filter results in Python
     ann_query = """
         SELECT device_id, snapshot_time, embedding, metrics, is_anomalous
         FROM device_state_snapshots
-        WHERE device_id = %s AND date = %s
         ORDER BY embedding ANN OF %s
         LIMIT %s
     """
     
     result = session.execute(
         ann_query,
-        (device_id, date, query_embedding, limit)
+        (query_embedding, limit)
     )
     
+    # Filter results to only include the target device_id
     similar_snapshots = []
     for row in result:
-        similar_snapshots.append({
-            'device_id': row.device_id,
-            'snapshot_time': row.snapshot_time,
-            'embedding': row.embedding,
-            'metrics': row.metrics,
-            'is_anomalous': row.is_anomalous
-        })
+        if row.device_id == device_id:
+            similar_snapshots.append({
+                'device_id': row.device_id,
+                'snapshot_time': row.snapshot_time,
+                'embedding': row.embedding,
+                'metrics': row.metrics,
+                'is_anomalous': row.is_anomalous
+            })
     
-    return similar_snapshots
+    return similar_snapshots[:10]  # Return top 10 for target device
 
 
 def compute_cosine_similarity(embedding1: list, embedding2: list) -> float:
@@ -193,41 +208,43 @@ def check_metric_outliers(snapshot_metrics: Dict, profile_stats: Dict,
     return outliers
 
 
-def record_anomaly(session, device_id: str, snapshot_time: datetime,
+def record_anomaly(session, device_id: str, device_type: str, snapshot_time: datetime,
                    similarity_score: float, outlier_metrics: Dict,
                    similar_count: int = 0):
     """Record an anomaly event in ScyllaDB."""
-    date_str = snapshot_time.strftime('%Y-%m-%d')
+    import uuid
     
+    date_str = snapshot_time.strftime('%Y-%m-%d')
     anomaly_score = 1.0 - similarity_score
     
-    # Prepare metrics snapshot
+    # Prepare metrics snapshot - must be map<text, double>
     metrics_snapshot = {
-        'similarity_score': str(similarity_score),
-        'outlier_count': str(len(outlier_metrics)),
-        'similar_normal_count': str(similar_count),
-        'detection_method': 'vector_search_ann'
+        'similarity_score': float(similarity_score),
+        'outlier_count': float(len(outlier_metrics)),
+        'similar_normal_count': float(similar_count)
     }
     
-    # Add outlier details
+    # Add outlier details as doubles
     for metric_name, outlier_info in outlier_metrics.items():
-        metrics_snapshot[f'outlier_{metric_name}'] = str(outlier_info['z_score'])
+        metrics_snapshot[f'outlier_{metric_name}'] = float(outlier_info['z_score'])
     
-    # Insert into anomaly_events
+    # Insert into anomaly_events with correct schema
     insert_event = """
         INSERT INTO anomaly_events
-        (device_id, detected_at, anomaly_score, anomaly_type, metrics_snapshot)
-        VALUES (%s, %s, %s, %s, %s)
+        (device_id, date, anomaly_id, device_type, detected_at, snapshot_time,
+         anomaly_score, anomaly_type, metrics_snapshot, resolution_status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     
     session.execute(
         insert_event,
-        (device_id, snapshot_time, anomaly_score, 'vector_search', metrics_snapshot)
+        (device_id, date_str, uuid.uuid1(), device_type, snapshot_time, snapshot_time,
+         anomaly_score, 'vector_search', metrics_snapshot, 'open')
     )
     
-    # Update device statistics
+    # Update device statistics counter
     session.execute(
-        "UPDATE device_statistics SET anomalies_detected = anomalies_detected + 1 WHERE device_id = %s",
+        "UPDATE device_statistics SET anomaly_count = anomaly_count + 1 WHERE device_id = %s",
         (device_id,)
     )
     
@@ -247,6 +264,7 @@ def record_anomaly(session, device_id: str, snapshot_time: datetime,
 def analyze_snapshot_with_vector_search(
     session,
     device_id: str,
+    device_type: str,
     snapshot,
     profile: Dict,
     similarity_threshold: float = SIMILARITY_THRESHOLD,
@@ -298,12 +316,10 @@ def analyze_snapshot_with_vector_search(
         sigma_threshold=sigma_threshold
     )
     
-    # Determine if anomalous using multiple signals
-    is_anomalous = (
-        profile_similarity < similarity_threshold or  # Low similarity to profile
-        similar_normal_count < 3 or  # Few similar normal snapshots found
-        len(outlier_metrics) > 0  # Statistical outliers
-    )
+    # Determine if anomalous using embedding similarity only
+    # For demo purposes: disable statistical outlier detection due to high variance
+    # in simulated data. Only flag based on low vector similarity to profile.
+    is_anomalous = profile_similarity < similarity_threshold
     
     result = {
         'device_id': device_id,
@@ -323,14 +339,11 @@ def analyze_snapshot_with_vector_search(
             f"Low profile similarity: {profile_similarity:.3f} < {similarity_threshold}"
         )
     
-    if similar_normal_count < 3:
+    if len(outlier_metrics) >= 3:
+        outlier_names = list(outlier_metrics.keys())
+        z_scores = [outlier_metrics[m]['z_score'] for m in outlier_names]
         result['anomaly_reasons'].append(
-            f"Few similar normal snapshots: {similar_normal_count} < 3 (vector search)"
-        )
-    
-    if outlier_metrics:
-        result['anomaly_reasons'].append(
-            f"Outlier metrics: {', '.join(outlier_metrics.keys())}"
+            f"Extreme outliers ({len(outlier_metrics)} metrics): {', '.join(outlier_names[:3])} (Z-scores: {', '.join(f'{z:.1f}' for z in z_scores[:3])})"
         )
     
     return result
@@ -341,29 +354,30 @@ def detect_anomalies_for_device(
     device_id: str,
     hours_back: int = 1,
     similarity_threshold: float = SIMILARITY_THRESHOLD,
-    record_events: bool = True
+    record_events: bool = True,
+    only_new: bool = False
 ) -> list:
     """
     Detect anomalies for a single device using vector search.
-    """
-    print(f"\n🔍 Analyzing {device_id} (with Vector Search)...")
     
+    Args:
+        only_new: If True, only analyze snapshots that haven't been checked yet
+    """
     # Get device profile
     profile = get_device_profile(session, device_id)
     if not profile:
-        print(f"  ⚠️  No profile found - run build_profiles.py first")
         return []
     
-    print(f"  ✓ Profile loaded (created {profile['profile_created_at']})")
+    device_type = profile['device_type']
     
-    # Get recent snapshots
-    snapshots = get_recent_snapshots(session, device_id, hours_back=hours_back)
+    # Get recent snapshots (optionally only new/unanalyzed ones)
+    snapshots = get_recent_snapshots(session, device_id, hours_back=hours_back, only_new=only_new)
     
     if not snapshots:
-        print(f"  ℹ️  No recent snapshots found")
         return []
     
-    print(f"  ✓ Analyzing {len(snapshots)} snapshot(s) with ANN queries...")
+    if len(snapshots) > 0:
+        print(f"  🔍 {device_id}: Analyzing {len(snapshots)} snapshot(s)...")
     
     # Analyze each snapshot using vector search
     results = []
@@ -376,6 +390,7 @@ def detect_anomalies_for_device(
         result = analyze_snapshot_with_vector_search(
             session,
             device_id,
+            device_type,
             snapshot,
             profile,
             similarity_threshold=similarity_threshold
@@ -391,25 +406,16 @@ def detect_anomalies_for_device(
                 record_anomaly(
                     session,
                     device_id,
+                    device_type,
                     snapshot.snapshot_time,
                     result['profile_similarity'],
                     result['outlier_metrics'],
                     result['similar_normal_count']
                 )
     
-    # Print summary
+    # Print summary (only if we found something)
     if anomalies_found > 0:
-        print(f"  🚨 {anomalies_found} anomal{'y' if anomalies_found == 1 else 'ies'} detected!")
-        for result in results:
-            if result['is_anomalous']:
-                print(f"      {result['snapshot_time']}: {', '.join(result['anomaly_reasons'])}")
-                print(f"         (Similar normal: {result['similar_normal_count']}, Profile sim: {result['profile_similarity']:.3f})")
-    else:
-        avg_profile_sim = np.mean([r['profile_similarity'] for r in results])
-        avg_similar_count = np.mean([r['similar_normal_count'] for r in results])
-        print(f"  ✅ All snapshots normal")
-        print(f"     Avg profile similarity: {avg_profile_sim:.3f}")
-        print(f"     Avg similar normal count: {avg_similar_count:.1f}")
+        print(f"     🚨 Found {anomalies_found} anomal{'y' if anomalies_found == 1 else 'ies'}!")
     
     return results
 
@@ -431,16 +437,21 @@ def main():
         help='Hours of recent snapshots to analyze (default: 1)'
     )
     parser.add_argument(
+        '--only-new',
+        action='store_true',
+        help='Only analyze snapshots not yet marked (for continuous mode)'
+    )
+    parser.add_argument(
         '--similarity-threshold',
         type=float,
         default=SIMILARITY_THRESHOLD,
-        help=f'Similarity threshold for anomaly detection (default: {SIMILARITY_THRESHOLD})'
+        help=f'Similarity threshold for anomaly detection (default: {SIMILARITY_THRESHOLD}, lower = stricter)'
     )
     parser.add_argument(
         '--sigma-threshold',
         type=float,
-        default=3.0,
-        help='Standard deviations for metric outlier detection (default: 3.0)'
+        default=SIGMA_THRESHOLD,
+        help=f'Standard deviations for metric outlier detection (default: {SIGMA_THRESHOLD}, higher = less sensitive)'
     )
     parser.add_argument(
         '--no-record',
@@ -463,6 +474,7 @@ def main():
     print(f"Similarity threshold: {args.similarity_threshold}")
     print(f"Sigma threshold: {args.sigma_threshold}")
     print(f"Record events: {not args.no_record}")
+    print(f"Only new snapshots: {args.only_new}")
     print(f"Uses: ORDER BY embedding ANN OF <vector> queries")
     
     # Connect to ScyllaDB
@@ -472,6 +484,7 @@ def main():
     def run_detection():
         all_results = []
         total_anomalies = 0
+        total_checked = 0
         
         for device_id in args.devices:
             results = detect_anomalies_for_device(
@@ -479,26 +492,26 @@ def main():
                 device_id,
                 hours_back=args.hours_back,
                 similarity_threshold=args.similarity_threshold,
-                record_events=not args.no_record
+                record_events=not args.no_record,
+                only_new=args.only_new
             )
             all_results.extend(results)
             total_anomalies += sum(1 for r in results if r['is_anomalous'])
+            total_checked += len(results)
         
-        # Summary
-        print("\n" + "=" * 70)
-        print(f"Summary: {total_anomalies} anomal{'y' if total_anomalies == 1 else 'ies'} "
-              f"out of {len(all_results)} snapshots")
-        print(f"Detection method: ScyllaDB Vector Search (ANN)")
+        # Summary (only print if we checked something)
+        if total_checked > 0:
+            timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
+            print(f"[{timestamp}] Checked {total_checked} snapshots → {total_anomalies} anomal{'y' if total_anomalies == 1 else 'ies'}")
         
         return total_anomalies
     
     if args.continuous:
         import time
-        print("\n🔄 Running continuously (Ctrl+C to stop)...")
+        print("\n🔄 Running continuously (Ctrl+C to stop)...\n")
         try:
             while True:
                 run_detection()
-                print(f"\n💤 Sleeping 30 seconds...\n")
                 time.sleep(30)
         except KeyboardInterrupt:
             print("\n\n✋ Stopped by user")

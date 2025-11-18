@@ -414,7 +414,7 @@ def get_device_history(device_id: str, hours_back: int):
             if date_str == start_time.strftime('%Y-%m-%d'):
                 result = session.execute(
                     """
-                    SELECT snapshot_time, device_type, metrics
+                    SELECT snapshot_time, device_type, metrics, is_anomalous, anomaly_score
                     FROM device_state_snapshots
                     WHERE device_id = %s AND date = %s AND snapshot_time >= %s
                     ORDER BY snapshot_time ASC
@@ -424,7 +424,7 @@ def get_device_history(device_id: str, hours_back: int):
             else:
                 result = session.execute(
                     """
-                    SELECT snapshot_time, device_type, metrics
+                    SELECT snapshot_time, device_type, metrics, is_anomalous, anomaly_score
                     FROM device_state_snapshots
                     WHERE device_id = %s AND date = %s
                     ORDER BY snapshot_time ASC
@@ -440,31 +440,131 @@ def get_device_history(device_id: str, hours_back: int):
         return []
 
 
-def build_metric_graphs(device_id: str, rows: List[Dict]):
-    """Create a grid of small line charts for each metric."""
+def get_anomaly_events(device_id: str, hours_back: int):
+    """Fetch anomaly events for a device."""
+    try:
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(hours=hours_back)
+        dates = sorted({start_time.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d')})
+        
+        anomalies = []
+        for date_str in dates:
+            result = session.execute(
+                """
+                SELECT detected_at, anomaly_score, anomaly_type, metrics_snapshot
+                FROM anomaly_events
+                WHERE device_id = %s AND date = %s AND detected_at >= %s
+                ORDER BY detected_at ASC
+                """,
+                (device_id, date_str, start_time)
+            )
+            anomalies.extend(result)
+        
+        return anomalies
+    except Exception as e:
+        print(f"Error fetching anomalies for {device_id}: {e}")
+        return []
+
+
+def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None):
+    """Create a grid of small line charts for each metric with anomaly markers."""
     if not rows:
         return html.Div("No historical data found.", style={'color': '#7f8c8d'})
+    
     # Build time series per metric
     times = [r.snapshot_time for r in rows]
+    anomaly_flags = [r.is_anomalous for r in rows]
+    
     # Collect metrics keys
     metric_keys = set()
     for r in rows:
         metric_keys.update(r.metrics.keys())
+    
+    # Build anomaly lookup by timestamp
+    anomaly_map = {}
+    if anomalies:
+        for anom in anomalies:
+            # Create reason string from metrics_snapshot
+            reasons = []
+            if anom.metrics_snapshot:
+                similarity = anom.metrics_snapshot.get('similarity_score')
+                if similarity and similarity < 0.75:
+                    reasons.append(f"Low similarity: {similarity:.3f}")
+                
+                # Find outlier metrics
+                outliers = [k.replace('outlier_', '') for k in anom.metrics_snapshot.keys() 
+                           if k.startswith('outlier_')]
+                if outliers:
+                    reasons.append(f"Outliers: {', '.join(outliers[:3])}")
+            
+            reason_text = '; '.join(reasons) if reasons else 'Anomalous behavior detected'
+            anomaly_map[anom.detected_at] = {
+                'score': anom.anomaly_score,
+                'type': anom.anomaly_type,
+                'reason': reason_text
+            }
+    
     # Create a small graph per metric
     graphs = []
     for metric in sorted(metric_keys):
         y = [r.metrics.get(metric) for r in rows]
+        
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=times, y=y, mode='lines', name=metric))
+        
+        # Main line trace
+        fig.add_trace(go.Scatter(
+            x=times, 
+            y=y, 
+            mode='lines', 
+            name=metric,
+            line=dict(color='#3498db', width=2)
+        ))
+        
+        # Add anomaly markers
+        anomaly_times = [t for t, flag in zip(times, anomaly_flags) if flag]
+        anomaly_y = [y[i] for i, flag in enumerate(anomaly_flags) if flag]
+        
+        if anomaly_times:
+            # Build hover text for anomaly points
+            hover_texts = []
+            for t in anomaly_times:
+                if t in anomaly_map:
+                    anom_info = anomaly_map[t]
+                    hover_texts.append(
+                        f"⚠️ ANOMALY<br>" +
+                        f"Time: {t.strftime('%H:%M:%S')}<br>" +
+                        f"Score: {anom_info['score']:.3f}<br>" +
+                        f"{anom_info['reason']}"
+                    )
+                else:
+                    hover_texts.append(f"⚠️ ANOMALY<br>Time: {t.strftime('%H:%M:%S')}")
+            
+            fig.add_trace(go.Scatter(
+                x=anomaly_times,
+                y=anomaly_y,
+                mode='markers',
+                name='Anomaly',
+                marker=dict(
+                    size=12,
+                    color='#e74c3c',
+                    symbol='x',
+                    line=dict(width=2, color='#c0392b')
+                ),
+                hovertext=hover_texts,
+                hoverinfo='text'
+            ))
+        
         fig.update_layout(
             title=metric.replace('_', ' ').title(),
             margin=dict(l=20, r=10, t=30, b=20),
             height=220,
             template='plotly_white',
             xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=True)
+            yaxis=dict(showgrid=True),
+            showlegend=False
         )
         graphs.append(dcc.Graph(figure=fig, config={'displayModeBar': False}))
+    
     # Render as CSS grid
     return html.Div(graphs, style={
         'display': 'grid',
@@ -481,14 +581,33 @@ def build_metric_graphs(device_id: str, rows: List[Dict]):
     prevent_initial_call=True
 )
 def on_device_click(n_clicks_list, current_search):
+    # Check if this was actually triggered by a real click
     if not ctx.triggered_id:
         return no_update
-    # Get the device_id from the triggered card
+    
+    # Get which card was clicked
     triggered_id = ctx.triggered_id
-    if isinstance(triggered_id, dict) and 'device_id' in triggered_id:
-        device_id = triggered_id['device_id']
-        return f'?device={device_id}'
-    return no_update
+    if not isinstance(triggered_id, dict) or 'device_id' not in triggered_id:
+        return no_update
+    
+    # Find the index of the triggered card to check its n_clicks
+    triggered_prop = ctx.triggered[0]['prop_id']
+    # triggered_prop looks like: '{"device_id":"RTU-002","type":"device-card"}.n_clicks'
+    
+    # Only update if we have a real click (not 0 or None)
+    # The issue is cards recreating with n_clicks=0 triggers this callback
+    if not any(n_clicks_list):  # All are None or 0
+        return no_update
+    
+    device_id = triggered_id['device_id']
+    new_url = f'?device={device_id}'
+    
+    # Don't update if URL would be the same
+    if current_search == new_url:
+        return no_update
+    
+    print(f"Device clicked: {device_id}, updating URL to {new_url}")
+    return new_url
 
 
 # Update label and graphs when selection or time range changes
@@ -513,9 +632,13 @@ def update_device_detail(url_search, hours_back, _n):
         if not devices:
             return no_update, no_update
         selected_device_id = devices[0]['device_id']
+        print(f"No device in URL, defaulting to: {selected_device_id}")
+    else:
+        print(f"URL has device: {selected_device_id}")
     
     rows = get_device_history(selected_device_id, hours_back or 6)
-    graphs = build_metric_graphs(selected_device_id, rows)
+    anomalies = get_anomaly_events(selected_device_id, hours_back or 6)
+    graphs = build_metric_graphs(selected_device_id, rows, anomalies)
     return selected_device_id, graphs
 
 
@@ -538,7 +661,8 @@ def refresh_device_graphs(_n, url_search, hours_back):
     if not selected_device_id:
         return no_update
     rows = get_device_history(selected_device_id, hours_back or 6)
-    return build_metric_graphs(selected_device_id, rows)
+    anomalies = get_anomaly_events(selected_device_id, hours_back or 6)
+    return build_metric_graphs(selected_device_id, rows, anomalies)
 
 
 if __name__ == '__main__':
