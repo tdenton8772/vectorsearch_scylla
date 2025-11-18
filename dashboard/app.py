@@ -495,7 +495,8 @@ def on_device_click(n_clicks_list, id_list):
 # Update label and graphs when selection or time range changes
 @app.callback(
     [Output('selected-device-label', 'children'), Output('device-metric-graphs', 'children')],
-    [Input('selected-device-id', 'data'), Input('hours-back', 'value'), Input('interval-component', 'n_intervals')]
+    [Input('selected-device-id', 'data'), Input('hours-back', 'value')],
+    [State('interval-component', 'n_intervals')]
 )
 def update_device_detail(selected_device_id, hours_back, _n):
     # If no device selected yet, pick the first available
@@ -507,6 +508,20 @@ def update_device_detail(selected_device_id, hours_back, _n):
     rows = get_device_history(selected_device_id, hours_back or 6)
     graphs = build_metric_graphs(selected_device_id, rows)
     return selected_device_id, graphs
+
+
+# Separate callback to refresh graphs on interval without changing selection
+@app.callback(
+    Output('device-metric-graphs', 'children', allow_duplicate=True),
+    [Input('interval-component', 'n_intervals')],
+    [State('selected-device-id', 'data'), State('hours-back', 'value')],
+    prevent_initial_call=True
+)
+def refresh_device_graphs(_n, selected_device_id, hours_back):
+    if not selected_device_id:
+        return no_update
+    rows = get_device_history(selected_device_id, hours_back or 6)
+    return build_metric_graphs(selected_device_id, rows)
 
 
 if __name__ == '__main__':
