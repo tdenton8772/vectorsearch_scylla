@@ -115,8 +115,8 @@ app.layout = html.Div([
         html.Div(id='device-metric-graphs')
     ], style={'padding': '20px', 'backgroundColor': '#ffffff', 'borderTop': '1px solid #ddd'}),
     
-    # Stores
-    dcc.Store(id='selected-device-id'),
+    # URL location for device selection (most reliable)
+    dcc.Location(id='url', refresh=False),
     
     # Auto-refresh
     dcc.Interval(
@@ -473,35 +473,47 @@ def build_metric_graphs(device_id: str, rows: List[Dict]):
     })
 
 
-# Handle device card clicks → set selected device id
+# Handle device card clicks → update URL
 @app.callback(
-    Output('selected-device-id', 'data'),
+    Output('url', 'search'),
     Input({'type': 'device-card', 'device_id': ALL}, 'n_clicks'),
+    State('url', 'search'),
     prevent_initial_call=True
 )
-def on_device_click(n_clicks_list):
+def on_device_click(n_clicks_list, current_search):
     if not ctx.triggered_id:
         return no_update
     # Get the device_id from the triggered card
     triggered_id = ctx.triggered_id
     if isinstance(triggered_id, dict) and 'device_id' in triggered_id:
-        return triggered_id['device_id']
+        device_id = triggered_id['device_id']
+        return f'?device={device_id}'
     return no_update
 
 
 # Update label and graphs when selection or time range changes
 @app.callback(
     [Output('selected-device-label', 'children'), Output('device-metric-graphs', 'children')],
-    [Input('selected-device-id', 'data'), Input('hours-back', 'value')],
+    [Input('url', 'search'), Input('hours-back', 'value')],
     [State('interval-component', 'n_intervals')]
 )
-def update_device_detail(selected_device_id, hours_back, _n):
-    # If no device selected yet, pick the first available
+def update_device_detail(url_search, hours_back, _n):
+    # Parse device from URL
+    selected_device_id = None
+    if url_search and 'device=' in url_search:
+        # Extract device_id from ?device=RTU-001
+        try:
+            selected_device_id = url_search.split('device=')[1].split('&')[0]
+        except:
+            pass
+    
+    # If no device in URL, pick the first available
     if not selected_device_id:
         devices = get_latest_device_states()
         if not devices:
             return no_update, no_update
         selected_device_id = devices[0]['device_id']
+    
     rows = get_device_history(selected_device_id, hours_back or 6)
     graphs = build_metric_graphs(selected_device_id, rows)
     return selected_device_id, graphs
@@ -511,10 +523,18 @@ def update_device_detail(selected_device_id, hours_back, _n):
 @app.callback(
     Output('device-metric-graphs', 'children', allow_duplicate=True),
     [Input('interval-component', 'n_intervals')],
-    [State('selected-device-id', 'data'), State('hours-back', 'value')],
+    [State('url', 'search'), State('hours-back', 'value')],
     prevent_initial_call=True
 )
-def refresh_device_graphs(_n, selected_device_id, hours_back):
+def refresh_device_graphs(_n, url_search, hours_back):
+    # Parse device from URL
+    selected_device_id = None
+    if url_search and 'device=' in url_search:
+        try:
+            selected_device_id = url_search.split('device=')[1].split('&')[0]
+        except:
+            pass
+    
     if not selected_device_id:
         return no_update
     rows = get_device_history(selected_device_id, hours_back or 6)
