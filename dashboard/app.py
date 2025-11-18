@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List
 
 import dash
-from dash import dcc, html, dash_table, no_update
+from dash import dcc, html, dash_table, no_update, ctx
 from dash.dependencies import Input, Output, State, ALL
 import plotly.graph_objs as go
 from cassandra.cluster import Cluster
@@ -477,19 +477,16 @@ def build_metric_graphs(device_id: str, rows: List[Dict]):
 @app.callback(
     Output('selected-device-id', 'data'),
     Input({'type': 'device-card', 'device_id': ALL}, 'n_clicks'),
-    State({'type': 'device-card', 'device_id': ALL}, 'id')
+    prevent_initial_call=True
 )
-def on_device_click(n_clicks_list, id_list):
-    if not n_clicks_list or not id_list:
+def on_device_click(n_clicks_list):
+    if not ctx.triggered_id:
         return no_update
-    # Choose the device with the highest click count (last clicked)
-    max_clicks = -1
-    selected = None
-    for n, ident in zip(n_clicks_list, id_list):
-        if n and n > max_clicks:
-            max_clicks = n
-            selected = ident.get('device_id')
-    return selected
+    # Get the device_id from the triggered card
+    triggered_id = ctx.triggered_id
+    if isinstance(triggered_id, dict) and 'device_id' in triggered_id:
+        return triggered_id['device_id']
+    return no_update
 
 
 # Update label and graphs when selection or time range changes
