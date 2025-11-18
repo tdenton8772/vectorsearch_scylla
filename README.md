@@ -73,9 +73,8 @@ This system demonstrates how ScyllaDB's vector search capabilities enable intell
 
 ### Key Technologies
 
-- **ScyllaDB Cloud**: Vector search, time-series storage (2025.4.0 RC)
+- **ScyllaDB Cloud**: Vector search, time-series storage, and metric aggregation (2025.4.0 RC)
 - **Kafka**: Message streaming and event processing
-- **Redis**: Metric aggregation buffer
 - **Ollama**: Local embedding generation (all-minilm:l6-v2)
 - **Dash**: Real-time visualization dashboard
 - **Python**: Application logic and simulators
@@ -117,7 +116,7 @@ The system learns "normal" behavior patterns and flags deviations automatically.
          ▼
 ┌─────────────────┐
 │ Kafka Consumer  │  Consumer group: iot-consumer-group
-│ + Redis Buffer  │  Aggregation window: 20 seconds
+│ + ScyllaDB Buffer│  Aggregation window: 60 seconds
 └────────┬────────┘
          │ Aggregated device snapshots
          ▼
@@ -133,6 +132,10 @@ The system learns "normal" behavior patterns and flags deviations automatically.
 │                                             │
 │  device_metrics_raw                         │
 │  ├─ Raw time-series (30-day TTL)           │
+│                                             │
+│  metric_aggregation_buffer                  │
+│  ├─ Temporary metric buffer (1-hour TTL)   │
+│  └─ Replaces Redis for aggregation         │
 │                                             │
 │  device_state_snapshots                     │
 │  ├─ Aggregated snapshots + embeddings      │
@@ -159,7 +162,7 @@ The system learns "normal" behavior patterns and flags deviations automatically.
 ### Component Interaction
 
 1. **Producer** reads device configs, runs simulators, publishes to Kafka
-2. **Consumer** subscribes to Kafka, aggregates in Redis, generates embeddings, writes to ScyllaDB
+2. **Consumer** subscribes to Kafka, aggregates in ScyllaDB buffer, generates embeddings, writes snapshots
 3. **Profile Builder** reads historical snapshots, computes centroids, stores fingerprints
 4. **Anomaly Detector** compares new snapshots to profiles, records events
 5. **Dashboard** queries ScyllaDB, displays real-time device status
@@ -170,10 +173,10 @@ The system learns "normal" behavior patterns and flags deviations automatically.
 
 ### 1. Complete Data Pipeline (Phases 2 & 3 ✅)
 
-Full pipeline: Device Simulators → Kafka → Redis → Ollama Embeddings → ScyllaDB → Dashboard
+Full pipeline: Device Simulators → Kafka → ScyllaDB Aggregation → Ollama Embeddings → ScyllaDB → Dashboard
 
 ```bash
-# Start Kafka infrastructure (Zookeeper, Kafka, Redis)
+# Start Kafka infrastructure (Zookeeper, Kafka)
 ./pipeline/start_local.sh
 
 # Start producer (5 devices, 10-second intervals)
@@ -296,16 +299,17 @@ See [THREE_DETECTION_PATHS.md](docs/THREE_DETECTION_PATHS.md) for complete compa
 **Processing Pipeline**:
 
 ```
-Kafka Message → Redis Buffer → Aggregation Window → Embedding → ScyllaDB
-                 (20 seconds)    (all metrics)      (Ollama)   (2 inserts)
+Kafka Message → ScyllaDB Buffer → Aggregation Window → Embedding → ScyllaDB
+                 (60 seconds)        (all metrics)      (Ollama)   (2 inserts)
 ```
 
 **Aggregation Logic**:
-1. Buffer metrics per device in Redis with TTL
-2. Every 20 seconds (configurable), collect all metrics for each device
+1. Buffer metrics per device in ScyllaDB `metric_aggregation_buffer` table (TTL: 1 hour)
+2. Every 60 seconds (configurable), collect all metrics for each device
 3. Convert to natural language: `"RTU-001 rooftopunit: supply air 72.5°F, return air 68.3°F, ..."`
 4. Generate embedding via Ollama API
 5. Write both raw metrics and snapshot to ScyllaDB
+6. Delete buffer after processing
 
 **Consumer Group**: `iot-consumer-group` (enables horizontal scaling)
 
@@ -719,8 +723,8 @@ Result: ~70 messages per tick (5 devices × 14 metrics)
 ### 2. Aggregation & Embedding
 
 ```
-Kafka Consumer              Redis                  Ollama              ScyllaDB
-==============              =====                  ======              ========
+Kafka Consumer          ScyllaDB Buffer         Ollama              ScyllaDB
+==============          ===============         ======              ========
 
 Continuous:
 
@@ -728,25 +732,25 @@ Continuous:
     ↓                        
   For each message:          
     ↓                        
-    add_to_redis()  ───────→ device:{id}:metrics
-                             TTL: 60 seconds
+    write_to_buffer()  ─────→ metric_aggregation_buffer
+                               TTL: 1 hour
 
-Every 20 seconds:
+Every 60 seconds:
 
   check_ready_devices()
     ↓
   For each device:
     ↓
-    fetch_all_metrics() ───→ HGETALL device:{id}:metrics
-    ↓
-    create_text()
+    fetch_window() ─────────→ SELECT * FROM buffer
+    ↓                         WHERE device_id = ?
+    create_text()              AND window_start = ?
       "RTU-001: temp=72F, ..."
     ↓
     generate_embedding() ──→ POST /api/embeddings
     ↓                                ↓
     write_to_scylla() ────────→ 384-dim vector
-      - device_metrics_raw          ↓
-      - device_state_snapshots ←────┘
+      - device_state_snapshots      ↓
+      - DELETE FROM buffer ←──────┘
 ```
 
 ### 3. Profile Building
@@ -846,7 +850,7 @@ python pipeline/kafka_producer.py \
 
 **Terminal 3: Consumer**
 ```bash
-python pipeline/kafka_consumer.py --aggregation-window 20
+python pipeline/kafka_consumer.py --aggregation-window 60
 ```
 
 **Terminal 4: Dashboard**
@@ -913,11 +917,30 @@ docker exec -it kafka kafka-consumer-groups \
     --describe
 ```
 
-**Redis Buffer**:
+**ScyllaDB Buffer**:
 ```bash
-docker exec -it redis redis-cli
-> KEYS device:*
-> HGETALL device:RTU-001:metrics
+python -c "
+from cassandra.cluster import Cluster
+from cassandra.auth import PlainTextAuthProvider
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+auth = PlainTextAuthProvider(
+    username=os.getenv('SCYLLA_USERNAME'),
+    password=os.getenv('SCYLLA_PASSWORD')
+)
+cluster = Cluster(
+    os.getenv('SCYLLA_HOSTS').split(','),
+    port=int(os.getenv('SCYLLA_PORT', '19042')),
+    auth_provider=auth
+)
+session = cluster.connect('iot_monitoring')
+result = session.execute('SELECT device_id, window_start, count(*) FROM metric_aggregation_buffer GROUP BY device_id, window_start ALLOW FILTERING')
+for row in result:
+    print(f'{row.device_id} @ {row.window_start}: {row.count} metrics')
+cluster.shutdown()
+"
 ```
 
 ### Testing
@@ -962,8 +985,8 @@ docker-compose -f pipeline/docker-compose.yml down
 #### Phase 2: Data Pipeline ✅
 - ✅ Kafka infrastructure (local Docker)
 - ✅ Producer: Streams individual metrics to Kafka
-- ✅ Consumer: Redis aggregation → Ollama embeddings → ScyllaDB
-- ✅ ScyllaDB schema with vector indexes (COSINE similarity)
+- ✅ Consumer: ScyllaDB aggregation → Ollama embeddings → ScyllaDB
+- ✅ ScyllaDB schema with vector indexes and aggregation buffer (COSINE similarity)
 - ✅ 384-dim embeddings via Ollama all-minilm:l6-v2
 
 #### Phase 3: Anomaly Detection ✅
@@ -1002,10 +1025,6 @@ SCYLLA_KEYSPACE=iot_monitoring
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 KAFKA_TOPIC=iot-metrics
 
-# Redis Configuration
-REDIS_HOST=localhost
-REDIS_PORT=6379
-
 # Ollama Configuration
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=all-minilm:l6-v2
@@ -1035,7 +1054,23 @@ CREATE TABLE device_metrics_raw (
   AND default_time_to_live = 2592000;  -- 30 days
 ```
 
-**2. device_state_snapshots**
+**2. metric_aggregation_buffer**
+```sql
+CREATE TABLE metric_aggregation_buffer (
+    device_id text,
+    window_start timestamp,
+    metric_name text,
+    metric_value double,
+    device_type text STATIC,
+    location text STATIC,
+    building_id text STATIC,
+    last_updated timestamp,
+    PRIMARY KEY ((device_id, window_start), metric_name)
+) WITH CLUSTERING ORDER BY (metric_name ASC)
+  AND default_time_to_live = 3600;  -- 1 hour (replaces Redis)
+```
+
+**3. device_state_snapshots**
 ```sql
 CREATE TABLE device_state_snapshots (
     device_id text,
@@ -1059,7 +1094,7 @@ ON device_state_snapshots(embedding)
 USING 'StorageAttachedIndex';
 ```
 
-**3. device_profiles**
+**4. device_profiles**
 ```sql
 CREATE TABLE device_profiles (
     device_id text PRIMARY KEY,
@@ -1074,7 +1109,7 @@ CREATE TABLE device_profiles (
 );
 ```
 
-**4. anomaly_events**
+**5. anomaly_events**
 ```sql
 CREATE TABLE anomaly_events (
     device_id text,
@@ -1120,7 +1155,7 @@ Current deployment (`pipeline/fleet_config.json`):
 | Parameter | Default | Location | Description |
 |-----------|---------|----------|-------------|
 | `--interval` | 60s | Producer | Time between metric emissions |
-| `--aggregation-window` | 20s | Consumer | Metric aggregation window |
+| `--aggregation-window` | 60s | Consumer | Metric aggregation window |
 | `--similarity-threshold` | 0.85 | Detector | COSINE similarity for anomaly |
 | `--sigma-threshold` | 3.0 | Detector | Z-score for outlier detection |
 | `--days-back` | 1 | Profile Builder | Historical data for profiling |
@@ -1144,14 +1179,12 @@ Current deployment (`pipeline/fleet_config.json`):
    ```
 
 2. **Insufficient aggregation time**
-   - Wait 20+ seconds after starting producer
+   - Wait 60+ seconds after starting producer
    - Check consumer logs for "Writing snapshot" messages
 
-3. **Redis buffer empty**
-   ```bash
-   docker exec -it redis redis-cli KEYS 'device:*'
-   # Should show device:RTU-001:metrics, etc.
-   ```
+3. **ScyllaDB buffer empty**
+   - Query `metric_aggregation_buffer` table
+   - Should show active aggregation windows
 
 4. **Query using wrong date**
    - Dashboard queries current date only
@@ -1277,21 +1310,19 @@ Current deployment (`pipeline/fleet_config.json`):
 
 **Solutions**:
 
-1. **Redis memory**
-   ```bash
-   docker exec -it redis redis-cli INFO memory
-   # Increase maxmemory if needed
-   ```
+1. **ScyllaDB buffer table**
+   - TTL automatically expires old windows
+   - Monitor `metric_aggregation_buffer` table size
 
 2. **Consumer batch size**
    - Reduce `max_poll_records` in consumer config
 
 3. **Clear old data**
    ```bash
-   # Redis
-   docker exec -it redis redis-cli FLUSHDB
-   
-   # ScyllaDB uses TTL automatically
+   # ScyllaDB uses TTL automatically for all tables
+   # Buffer table: 1 hour TTL
+   # Raw metrics: 30 day TTL
+   # Snapshots: 90 day TTL
    ```
 
 ### Dashboard Performance
@@ -1324,11 +1355,11 @@ reinvent_demo/
 │
 ├── pipeline/
 │   ├── kafka_producer.py     # 286 lines, streaming logic
-│   ├── kafka_consumer.py     # 519 lines, aggregation + embeddings
+│   ├── kafka_consumer.py     # 509 lines, ScyllaDB aggregation + embeddings
 │   ├── build_profiles.py     # 304 lines, fingerprinting
 │   ├── detect_anomalies.py   # 420 lines, anomaly detection
 │   ├── verify_data.py        # Data validation
-│   └── docker-compose.yml    # Local Kafka/Redis stack
+│   └── docker-compose.yml    # Local Kafka infrastructure
 │
 ├── dashboard/
 │   └── app.py                # 380 lines, Dash UI
@@ -1443,9 +1474,10 @@ watch -n 1 'docker exec -it kafka kafka-consumer-groups \
 - Automatic TTL for data lifecycle
 
 **Aggregation**:
-- Redis as temporary buffer
-- Time-window aggregation (20s)
+- ScyllaDB as temporary buffer (metric_aggregation_buffer table)
+- Time-window aggregation (60s)
 - Batch embedding generation
+- Auto-expiring with TTL (1 hour)
 
 ### Production Considerations
 

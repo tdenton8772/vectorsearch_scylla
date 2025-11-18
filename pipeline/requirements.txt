@@ -1,9 +1,6 @@
 # Kafka
 kafka-python==2.0.2
 
-# Redis
-redis==5.0.1
-
 # ScyllaDB / Cassandra
 cassandra-driver==3.29.1
 scylla-driver==3.26.9

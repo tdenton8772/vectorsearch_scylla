@@ -2,10 +2,11 @@
 """
 Kafka consumer that:
 1. Reads individual metrics from Kafka
-2. Aggregates metrics by device using Redis (time windows)
+2. Aggregates metrics by device using ScyllaDB (time windows)
 3. Generates embeddings (Ollama text-based)
 4. Writes to ScyllaDB:
    - Raw metrics → device_metrics_raw
+   - Buffered metrics → metric_aggregation_buffer
    - Aggregated state → device_state_snapshots
 
 Usage:
@@ -26,7 +27,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 from collections import defaultdict
 
-import redis
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
 from cassandra.cluster import Cluster
@@ -48,7 +48,7 @@ class IoTConsumer:
     """
     Kafka consumer that aggregates device metrics and writes to ScyllaDB.
     
-    Uses Redis for stateful aggregation by time window.
+    Uses ScyllaDB for stateful aggregation by time window (no Redis needed).
     Supports horizontal scaling via Kafka consumer groups.
     """
     
@@ -57,8 +57,6 @@ class IoTConsumer:
         kafka_brokers: str = 'localhost:9092',
         kafka_topic: str = 'iot-metrics',
         consumer_group: str = 'iot-consumer-group',
-        redis_host: str = 'localhost',
-        redis_port: int = 6379,
         aggregation_window: int = 60,  # seconds
         scylla_hosts: List[str] = None,
         scylla_port: int = 19042,
@@ -74,8 +72,6 @@ class IoTConsumer:
             kafka_brokers: Kafka broker addresses
             kafka_topic: Topic to consume from
             consumer_group: Consumer group ID (same group = auto partition balancing)
-            redis_host: Redis host for aggregation state
-            redis_port: Redis port
             aggregation_window: Time window in seconds for aggregating metrics
             scylla_hosts: ScyllaDB contact points
             scylla_port: ScyllaDB port
@@ -107,16 +103,6 @@ class IoTConsumer:
         )
         logger.info(f"✅ Kafka consumer initialized (group: {consumer_group})")
         
-        # Connect to Redis
-        logger.info(f"Connecting to Redis: {redis_host}:{redis_port}")
-        self.redis_client = redis.Redis(
-            host=redis_host,
-            port=redis_port,
-            decode_responses=True
-        )
-        self.redis_client.ping()  # Test connection
-        logger.info("✅ Redis connected")
-        
         # Connect to ScyllaDB
         logger.info(f"Connecting to ScyllaDB: {scylla_hosts}")
         if scylla_username and scylla_password:
@@ -138,6 +124,9 @@ class IoTConsumer:
         # Prepare statements for performance
         self._prepare_statements()
         
+        # Track active windows for efficient processing
+        self.active_windows = set()  # (device_id, window_start) tuples
+        
         # Statistics
         self.stats = {
             'messages_consumed': 0,
@@ -156,6 +145,27 @@ class IoTConsumer:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """)
         
+        # Insert/update metric in aggregation buffer
+        self.upsert_buffer_metric = self.scylla_session.prepare("""
+            INSERT INTO metric_aggregation_buffer
+            (device_id, window_start, metric_name, metric_value,
+             device_type, location, building_id, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """)
+        
+        # Query all metrics for a device window
+        self.query_buffer_metrics = self.scylla_session.prepare("""
+            SELECT metric_name, metric_value, device_type, location, building_id
+            FROM metric_aggregation_buffer
+            WHERE device_id = ? AND window_start = ?
+        """)
+        
+        # Delete buffer after processing
+        self.delete_buffer_window = self.scylla_session.prepare("""
+            DELETE FROM metric_aggregation_buffer
+            WHERE device_id = ? AND window_start = ?
+        """)
+        
         # Insert device state snapshot
         self.insert_snapshot = self.scylla_session.prepare("""
             INSERT INTO device_state_snapshots
@@ -165,11 +175,6 @@ class IoTConsumer:
         """)
         
         logger.info("✅ CQL statements prepared")
-    
-    def _get_redis_key(self, device_id: str, window_start: datetime) -> str:
-        """Generate Redis key for device aggregation window."""
-        window_ts = int(window_start.timestamp())
-        return f"device:{device_id}:window:{window_ts}"
     
     def _get_window_start(self, timestamp: datetime) -> datetime:
         """Get the start of the aggregation window for a timestamp."""
@@ -204,33 +209,28 @@ class IoTConsumer:
             self.stats['errors'] += 1
     
     def aggregate_metric(self, message: Dict):
-        """Add metric to Redis aggregation buffer."""
+        """Add metric to ScyllaDB aggregation buffer."""
         try:
             timestamp = datetime.fromisoformat(message['timestamp'].replace('Z', '+00:00'))
             window_start = self._get_window_start(timestamp)
-            redis_key = self._get_redis_key(message['device_id'], window_start)
             
-            # Store metric in Redis hash
-            # Key format: device:{device_id}:window:{timestamp}
-            # Hash fields: metric_name -> metric_value
-            self.redis_client.hset(redis_key, message['metric_name'], message['metric_value'])
+            # Track this window as active
+            self.active_windows.add((message['device_id'], window_start))
             
-            # Store metadata (only once per window)
-            meta_key = f"{redis_key}:meta"
-            if not self.redis_client.exists(meta_key):
-                meta = {
-                    'device_id': message['device_id'],
-                    'device_type': message['device_type'],
-                    'location': message['location'],
-                    'building_id': message['building_id'],
-                    'window_start': window_start.isoformat()
-                }
-                self.redis_client.set(meta_key, json.dumps(meta))
-            
-            # Set expiration (window + buffer for late arrivals)
-            expiration = self.aggregation_window * 3
-            self.redis_client.expire(redis_key, expiration)
-            self.redis_client.expire(meta_key, expiration)
+            # Upsert metric into buffer (ScyllaDB will overwrite if same key)
+            self.scylla_session.execute(
+                self.upsert_buffer_metric,
+                (
+                    message['device_id'],
+                    window_start,
+                    message['metric_name'],
+                    message['metric_value'],
+                    message['device_type'],
+                    message['location'],
+                    message['building_id'],
+                    datetime.now(timezone.utc)
+                )
+            )
             
         except Exception as e:
             logger.error(f"Error aggregating metric: {e}")
@@ -274,7 +274,7 @@ class IoTConsumer:
     
     def check_and_write_snapshots(self):
         """
-        Check Redis for completed aggregation windows and write to ScyllaDB.
+        Check ScyllaDB buffer for completed aggregation windows and write snapshots.
         
         A window is "complete" if it's older than aggregation_window + grace period.
         """
@@ -282,66 +282,69 @@ class IoTConsumer:
             now = datetime.now(timezone.utc)
             cutoff_time = now - timedelta(seconds=self.aggregation_window * 2)
             
-            # Scan for all device window keys
-            for key in self.redis_client.scan_iter(match="device:*:window:*", count=100):
-                # Skip metadata keys
-                if key.endswith(':meta'):
-                    continue
-                
-                # Parse window timestamp from key
-                parts = key.split(':')
-                if len(parts) != 4:
-                    continue
-                
-                device_id = parts[1]
-                window_ts = int(parts[3])
-                window_start = datetime.fromtimestamp(window_ts, tz=timezone.utc)
-                
-                # Check if window is complete (old enough)
-                if window_start >= cutoff_time:
-                    continue  # Still collecting metrics for this window
-                
-                # Get metadata
-                meta_key = f"{key}:meta"
-                meta_json = self.redis_client.get(meta_key)
-                if not meta_json:
-                    logger.warning(f"Missing metadata for {key}, skipping")
-                    continue
-                
-                meta = json.loads(meta_json)
-                
-                # Get all metrics for this window
-                metrics = self.redis_client.hgetall(key)
-                if not metrics:
-                    logger.warning(f"Empty metrics for {key}, skipping")
-                    continue
-                
-                # Convert metric values to floats
-                metrics_float = {k: float(v) for k, v in metrics.items()}
-                
-                # Build device state
-                device_state = {
-                    'device_id': meta['device_id'],
-                    'device_type': meta['device_type'],
-                    'location': meta['location'],
-                    'building_id': meta['building_id'],
-                    'window_start': window_start,
-                    'metrics': metrics_float
-                }
-                
-                # Generate embedding
-                embedding = self.generate_embedding_ollama(device_state)
-                
-                # Write to ScyllaDB
-                self.write_snapshot(device_state, embedding)
-                
-                # Delete from Redis (processed)
-                self.redis_client.delete(key, meta_key)
-                
-                logger.info(
-                    f"✅ Snapshot written: {device_id} @ {window_start.isoformat()} "
-                    f"({len(metrics_float)} metrics)"
-                )
+            # Process windows that are old enough
+            windows_to_process = [
+                (device_id, window_start)
+                for device_id, window_start in self.active_windows
+                if window_start < cutoff_time
+            ]
+            
+            for device_id, window_start in windows_to_process:
+                try:
+                    # Get all metrics for this window
+                    metrics_rows = self.scylla_session.execute(
+                        self.query_buffer_metrics,
+                        (device_id, window_start)
+                    )
+                    
+                    metrics_list = list(metrics_rows)
+                    if not metrics_list:
+                        # Window already processed or empty
+                        self.active_windows.discard((device_id, window_start))
+                        continue
+                    
+                    # Extract metadata from first row
+                    first_row = metrics_list[0]
+                    device_type = first_row.device_type
+                    location = first_row.location
+                    building_id = first_row.building_id
+                    
+                    # Build metrics dict
+                    metrics = {r.metric_name: r.metric_value for r in metrics_list}
+                    
+                    # Build device state
+                    device_state = {
+                        'device_id': device_id,
+                        'device_type': device_type,
+                        'location': location,
+                        'building_id': building_id,
+                        'window_start': window_start,
+                        'metrics': metrics
+                    }
+                    
+                    # Generate embedding
+                    embedding = self.generate_embedding_ollama(device_state)
+                    
+                    # Write to ScyllaDB
+                    self.write_snapshot(device_state, embedding)
+                    
+                    # Delete from buffer (processed)
+                    self.scylla_session.execute(
+                        self.delete_buffer_window,
+                        (device_id, window_start)
+                    )
+                    
+                    # Remove from active windows
+                    self.active_windows.discard((device_id, window_start))
+                    
+                    logger.info(
+                        f"✅ Snapshot written: {device_id} @ {window_start.isoformat()} "
+                        f"({len(metrics)} metrics)"
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error processing window {device_id}@{window_start}: {e}")
+                    self.stats['errors'] += 1
                 
         except Exception as e:
             logger.error(f"Error checking/writing snapshots: {e}")
@@ -385,6 +388,7 @@ class IoTConsumer:
         logger.info(f"  Consumer group: {self.consumer_group}")
         logger.info(f"  Aggregation window: {self.aggregation_window}s")
         logger.info(f"  Embedding method: {self.embedding_method}")
+        logger.info(f"  Using ScyllaDB for aggregation (no Redis)")
         
         last_snapshot_check = time.time()
         snapshot_check_interval = self.aggregation_window / 2  # Check twice per window
@@ -397,7 +401,7 @@ class IoTConsumer:
                     # Write raw metric to ScyllaDB
                     self.write_raw_metric(msg_value)
                     
-                    # Aggregate in Redis
+                    # Aggregate in ScyllaDB buffer
                     self.aggregate_metric(msg_value)
                     
                     self.stats['messages_consumed'] += 1
@@ -436,7 +440,6 @@ class IoTConsumer:
         
         # Close connections
         self.consumer.close()
-        self.redis_client.close()
         
         logger.info("\n=== Final Statistics ===")
         for key, value in self.stats.items():
@@ -446,7 +449,7 @@ class IoTConsumer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='IoT metrics Kafka consumer with Redis aggregation'
+        description='IoT metrics Kafka consumer with ScyllaDB aggregation'
     )
     parser.add_argument(
         '--kafka-brokers',
@@ -462,17 +465,6 @@ def main():
         '--group-id',
         default='iot-consumer-group',
         help='Consumer group ID for partition balancing (default: iot-consumer-group)'
-    )
-    parser.add_argument(
-        '--redis-host',
-        default='localhost',
-        help='Redis host (default: localhost)'
-    )
-    parser.add_argument(
-        '--redis-port',
-        type=int,
-        default=6379,
-        help='Redis port (default: 6379)'
     )
     parser.add_argument(
         '--aggregation-window',
@@ -501,8 +493,6 @@ def main():
         kafka_brokers=args.kafka_brokers,
         kafka_topic=args.kafka_topic,
         consumer_group=args.group_id,
-        redis_host=args.redis_host,
-        redis_port=args.redis_port,
         aggregation_window=args.aggregation_window,
         scylla_hosts=scylla_hosts,
         scylla_port=scylla_port,

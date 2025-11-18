@@ -4,9 +4,12 @@ Create ScyllaDB schema for IoT device metrics and embeddings.
 
 Tables:
 1. device_metrics_raw - Raw time series data (one metric per row)
-2. device_state_snapshots - Aggregated device state with embeddings
-3. device_profiles - Baseline normal behavior profiles
-4. anomaly_events - Detected anomalies
+2. metric_aggregation_buffer - Temporary buffer for windowed aggregation (replaces Redis)
+3. device_state_snapshots - Aggregated device state with embeddings
+4. device_profiles - Baseline normal behavior profiles
+5. device_statistics - Counter table for metrics
+6. anomaly_events - Detected anomalies
+7. recent_device_states - Materialized view for recent states
 """
 
 import os
@@ -88,7 +91,26 @@ def create_schema():
         ON device_metrics_raw (device_type)
     """)
     
-    # 2. Device state snapshots - aggregated state with embeddings
+    # 2. Metric aggregation buffer - temporary storage for windowed aggregation
+    # Replaces Redis for metric buffering
+    print("Creating table: metric_aggregation_buffer")
+    session.execute("""
+        CREATE TABLE IF NOT EXISTS metric_aggregation_buffer (
+            device_id text,
+            window_start timestamp,          -- Start of aggregation window
+            metric_name text,
+            metric_value double,
+            device_type text static,
+            location text static,
+            building_id text static,
+            last_updated timestamp,
+            PRIMARY KEY ((device_id, window_start), metric_name)
+        ) WITH CLUSTERING ORDER BY (metric_name ASC)
+          AND compression = {'sstable_compression': 'LZ4Compressor'}
+          AND default_time_to_live = 3600  -- Auto-expire after 1 hour
+    """)
+    
+    # 3. Device state snapshots - aggregated state with embeddings
     print("Creating table: device_state_snapshots")
     session.execute(f"""
         CREATE TABLE IF NOT EXISTS device_state_snapshots (
@@ -132,7 +154,7 @@ def create_schema():
             }}
         """)
     
-    # 3. Device profiles - baseline normal behavior
+    # 4. Device profiles - baseline normal behavior
     print("Creating table: device_profiles")
     session.execute(f"""
         CREATE TABLE IF NOT EXISTS device_profiles (
@@ -148,7 +170,7 @@ def create_schema():
         )
     """)
     
-    # 3b. Device statistics counters (separate table for counters)
+    # 5. Device statistics counters (separate table for counters)
     print("Creating table: device_statistics")
     session.execute("""
         CREATE TABLE IF NOT EXISTS device_statistics (
@@ -158,7 +180,7 @@ def create_schema():
         )
     """)
     
-    # 4. Anomaly events - flagged anomalies with similar devices
+    # 6. Anomaly events - flagged anomalies with similar devices
     print("Creating table: anomaly_events")
     session.execute("""
         CREATE TABLE IF NOT EXISTS anomaly_events (
@@ -192,7 +214,7 @@ def create_schema():
         ON anomaly_events (detected_at)
     """)
     
-    # 5. Create materialized view for recent device states (optional)
+    # 7. Create materialized view for recent device states (optional)
     # Note: MVs cannot include static columns - exclude device_type, location, building_id
     print("Creating materialized view: recent_device_states")
     session.execute("""
