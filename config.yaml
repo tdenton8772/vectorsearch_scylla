@@ -1,0 +1,97 @@
+# ScyllaDB Vector Search Demo Configuration
+# ==========================================
+
+# LLM Configuration
+llm:
+  providers:
+    - ollama
+    - openai
+  
+  # Ollama local LLM configuration
+  ollama:
+    base_url: http://localhost:11434
+    model: llama2
+    # Alternative models: llama3.2:latest, mistral, codellama
+  
+  # OpenAI configuration (if needed)
+  openai:
+    model: gpt-3.5-turbo
+    max_tokens: 2000
+    temperature: 0.1
+
+# Embeddings Configuration
+embeddings:
+  provider: ollama  # Options: ollama, openai, huggingface
+  model: all-minilm-l6-v2
+  # Note: all-minilm-l6-v2 produces 384-dimensional vectors
+  chunk_size: 512
+  chunk_overlap: 50
+
+# ScyllaDB Configuration
+scylladb:
+  # Cloud connection (from .env)
+  connection:
+    host: ${SCYLLADB_HOST}
+    port: ${SCYLLADB_PORT}
+    username: ${SCYLLADB_USERNAME}
+    password: ${SCYLLADB_PASSWORD}
+  
+  # Keyspace and table
+  keyspace:
+    name: vectordemo
+    replication_factor: 3
+    tablets_enabled: false  # MUST be false for vector search
+  
+  table:
+    name: documents
+    vector_dimension: 384  # Must match embedding model output
+  
+  # Vector index configuration
+  vector_index:
+    name: vector_idx
+    similarity_function: COSINE  # Options: COSINE, DOT_PRODUCT, EUCLIDEAN
+    options:
+      m: 16  # maximum_node_connections
+      ef_construct: 100
+      ef_search: 100
+
+# Application Settings
+app:
+  environment: development
+  log_level: INFO
+  
+  # Data paths
+  paths:
+    data: ./data
+    output: ./output
+    logs: ./logs
+  
+  # Processing settings
+  batch_size: 100
+  max_retries: 3
+  timeout: 30
+
+# Demo Configuration
+demo:
+  # Sample data settings
+  sample_data:
+    enabled: true
+    num_documents: 100
+  
+  # Query settings
+  query:
+    default_limit: 10
+    max_limit: 100
+  
+  # Performance settings
+  performance:
+    enable_metrics: true
+    metrics_port: 9090
+    rate_limit_rps: 100
+
+# Optional: RAG Configuration
+rag:
+  enabled: true
+  context_window: 3
+  relevance_threshold: 0.7
+  max_context_tokens: 1500

@@ -1,0 +1,19 @@
+# Kafka
+kafka-python==2.0.2
+
+# Redis
+redis==5.0.1
+
+# ScyllaDB / Cassandra
+cassandra-driver==3.29.1
+scylla-driver==3.26.9
+
+# Ollama API
+ollama==0.4.3
+
+# Data processing
+pandas==2.2.3
+numpy==1.26.4
+
+# Utilities
+python-dotenv==1.0.1

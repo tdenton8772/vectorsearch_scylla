@@ -1,0 +1,70 @@
+{
+  "devices": [
+    {
+      "device_id": "RTU-001",
+      "device_type": "rooftop_unit",
+      "location": "building-A",
+      "building_id": "bldg-001"
+    },
+    {
+      "device_id": "RTU-002",
+      "device_type": "rooftop_unit",
+      "location": "building-A",
+      "building_id": "bldg-001"
+    },
+    {
+      "device_id": "RTU-003",
+      "device_type": "rooftop_unit",
+      "location": "building-B",
+      "building_id": "bldg-002"
+    },
+    {
+      "device_id": "MAU-001",
+      "device_type": "makeup_air_unit",
+      "location": "building-A",
+      "building_id": "bldg-001"
+    },
+    {
+      "device_id": "MAU-002",
+      "device_type": "makeup_air_unit",
+      "location": "building-B",
+      "building_id": "bldg-002"
+    },
+    {
+      "device_id": "CH-001",
+      "device_type": "chiller",
+      "location": "building-A",
+      "building_id": "bldg-001"
+    },
+    {
+      "device_id": "CH-002",
+      "device_type": "chiller",
+      "location": "building-B",
+      "building_id": "bldg-002"
+    },
+    {
+      "device_id": "CT-001",
+      "device_type": "cooling_tower",
+      "location": "building-A",
+      "building_id": "bldg-001"
+    },
+    {
+      "device_id": "CT-002",
+      "device_type": "cooling_tower",
+      "location": "building-B",
+      "building_id": "bldg-002"
+    },
+    {
+      "device_id": "AC-001",
+      "device_type": "air_compressor",
+      "location": "building-A",
+      "building_id": "bldg-001"
+    },
+    {
+      "device_id": "AC-002",
+      "device_type": "air_compressor",
+      "location": "building-B",
+      "building_id": "bldg-002"
+    }
+  ]
+}

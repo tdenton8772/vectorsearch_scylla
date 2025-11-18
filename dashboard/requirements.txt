@@ -1,0 +1,9 @@
+# Dash framework
+dash==2.14.2
+plotly==5.18.0
+
+# ScyllaDB
+cassandra-driver==3.29.1
+
+# Utilities
+python-dotenv==1.0.1

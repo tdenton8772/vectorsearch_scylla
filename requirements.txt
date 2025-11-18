@@ -1,0 +1,20 @@
+# Core dependencies
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# ScyllaDB driver (NOT cassandra-driver)
+scylla-driver==3.29.3
+
+# Configuration
+pyyaml>=6.0
+
+# Ollama client
+ollama>=0.1.0
+
+# Optional: for enhanced functionality
+# OpenAI SDK (if using OpenAI instead of Ollama)
+# openai>=1.0.0
+
+# Optional: for data processing
+# pandas>=2.0.0
+# numpy>=1.24.0
