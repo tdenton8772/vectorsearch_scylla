@@ -7,12 +7,12 @@ Shows latest state of all devices with real-time updates.
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List
 
 import dash
-from dash import dcc, html, dash_table
-from dash.dependencies import Input, Output
+from dash import dcc, html, dash_table, no_update
+from dash.dependencies import Input, Output, State, ALL
 import plotly.graph_objs as go
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
@@ -87,6 +87,36 @@ app.layout = html.Div([
         html.H2("📊 Device Status", style={'color': '#2c3e50', 'marginBottom': '20px'}),
         html.Div(id='device-grid')
     ], style={'padding': '20px'}),
+
+    # Device detail section
+    html.Div([
+        html.H2("🔎 Device Details", style={'color': '#2c3e50', 'margin': '0 0 10px 0'}),
+        html.Div([
+            html.Div([
+                html.Span("Selected: ", style={'color': '#7f8c8d'}),
+                html.Strong(id='selected-device-label', children='(click a device card)')
+            ]),
+            html.Div([
+                html.Span("Time Range: ", style={'marginRight': '8px', 'color': '#7f8c8d'}),
+                dcc.Dropdown(
+                    id='hours-back',
+                    options=[
+                        {'label': '1 hour', 'value': 1},
+                        {'label': '3 hours', 'value': 3},
+                        {'label': '6 hours', 'value': 6},
+                        {'label': '24 hours', 'value': 24},
+                    ],
+                    value=6,
+                    clearable=False,
+                    style={'width': '180px'}
+                )
+            ], style={'display': 'flex', 'alignItems': 'center', 'gap': '10px'})
+        ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '10px'}),
+        html.Div(id='device-metric-graphs')
+    ], style={'padding': '20px', 'backgroundColor': '#ffffff', 'borderTop': '1px solid #ddd'}),
+    
+    # Stores
+    dcc.Store(id='selected-device-id'),
     
     # Auto-refresh
     dcc.Interval(
@@ -282,12 +312,13 @@ def create_device_card(device: Dict):
             'paddingTop': '10px',
             'borderTop': '1px solid #ecf0f1'
         })
-    ], style={
+    ], id={'type': 'device-card', 'device_id': device['device_id']}, n_clicks=0, style={
         'backgroundColor': 'white',
         'padding': '20px',
         'borderRadius': '8px',
         'boxShadow': '0 2px 4px rgba(0,0,0,0.1)',
-        'border': f'2px solid {status_color}' if device['is_anomalous'] else '1px solid #ddd'
+        'border': f'2px solid {status_color}' if device['is_anomalous'] else '1px solid #ddd',
+        'cursor': 'pointer'
     })
 
 
@@ -368,6 +399,114 @@ def update_devices(n):
         'gridTemplateColumns': 'repeat(auto-fill, minmax(320px, 1fr))',
         'gap': '20px'
     })
+
+
+def get_device_history(device_id: str, hours_back: int):
+    """Fetch historical snapshots for a device within the last N hours."""
+    try:
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(hours=hours_back)
+        # Collect dates to query (today and possibly yesterday)
+        dates = sorted({start_time.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d')})
+        rows = []
+        for date_str in dates:
+            # For each date, query snapshots with lower bound when applicable
+            if date_str == start_time.strftime('%Y-%m-%d'):
+                result = session.execute(
+                    """
+                    SELECT snapshot_time, device_type, metrics
+                    FROM device_state_snapshots
+                    WHERE device_id = %s AND date = %s AND snapshot_time >= %s
+                    ORDER BY snapshot_time ASC
+                    """,
+                    (device_id, date_str, start_time)
+                )
+            else:
+                result = session.execute(
+                    """
+                    SELECT snapshot_time, device_type, metrics
+                    FROM device_state_snapshots
+                    WHERE device_id = %s AND date = %s
+                    ORDER BY snapshot_time ASC
+                    """,
+                    (device_id, date_str)
+                )
+            rows.extend(list(result))
+        # Sort by time
+        rows.sort(key=lambda r: r.snapshot_time)
+        return rows
+    except Exception as e:
+        print(f"Error fetching history for {device_id}: {e}")
+        return []
+
+
+def build_metric_graphs(device_id: str, rows: List[Dict]):
+    """Create a grid of small line charts for each metric."""
+    if not rows:
+        return html.Div("No historical data found.", style={'color': '#7f8c8d'})
+    # Build time series per metric
+    times = [r.snapshot_time for r in rows]
+    # Collect metrics keys
+    metric_keys = set()
+    for r in rows:
+        metric_keys.update(r.metrics.keys())
+    # Create a small graph per metric
+    graphs = []
+    for metric in sorted(metric_keys):
+        y = [r.metrics.get(metric) for r in rows]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=times, y=y, mode='lines', name=metric))
+        fig.update_layout(
+            title=metric.replace('_', ' ').title(),
+            margin=dict(l=20, r=10, t=30, b=20),
+            height=220,
+            template='plotly_white',
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=True)
+        )
+        graphs.append(dcc.Graph(figure=fig, config={'displayModeBar': False}))
+    # Render as CSS grid
+    return html.Div(graphs, style={
+        'display': 'grid',
+        'gridTemplateColumns': 'repeat(auto-fill, minmax(320px, 1fr))',
+        'gap': '16px'
+    })
+
+
+# Handle device card clicks → set selected device id
+@app.callback(
+    Output('selected-device-id', 'data'),
+    Input({'type': 'device-card', 'device_id': ALL}, 'n_clicks'),
+    State({'type': 'device-card', 'device_id': ALL}, 'id')
+)
+def on_device_click(n_clicks_list, id_list):
+    if not n_clicks_list or not id_list:
+        return no_update
+    # Choose the device with the highest click count (last clicked)
+    max_clicks = -1
+    selected = None
+    for n, ident in zip(n_clicks_list, id_list):
+        if n and n > max_clicks:
+            max_clicks = n
+            selected = ident.get('device_id')
+    return selected
+
+
+# Update label and graphs when selection or time range changes
+@app.callback(
+    [Output('selected-device-label', 'children'), Output('device-metric-graphs', 'children')],
+    [Input('selected-device-id', 'data'), Input('hours-back', 'value'), Input('interval-component', 'n_intervals')]
+)
+def update_device_detail(selected_device_id, hours_back, _n):
+    # If no device selected yet, pick the first available
+    if not selected_device_id:
+        devices = get_latest_device_states()
+        if not devices:
+            return no_update, no_update
+        selected_device_id = devices[0]['device_id']
+    rows = get_device_history(selected_device_id, hours_back or 6)
+    graphs = build_metric_graphs(selected_device_id, rows)
+    return selected_device_id, graphs
 
 
 if __name__ == '__main__':
