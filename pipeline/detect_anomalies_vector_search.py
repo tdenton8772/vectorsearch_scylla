@@ -25,9 +25,12 @@ scylla_username = os.getenv('SCYLLA_USERNAME')
 scylla_password = os.getenv('SCYLLA_PASSWORD')
 scylla_keyspace = os.getenv('SCYLLA_KEYSPACE', 'iot_monitoring')
 
-# Anomaly detection thresholds
-SIMILARITY_THRESHOLD = 0.60  # Below this = anomalous (very relaxed for normal operation)
-SIGMA_THRESHOLD = 5.0  # Z-score threshold for outliers (default was 3.0)
+# Anomaly detection thresholds - 3-path approach
+PROFILE_SIMILARITY_THRESHOLD = 0.90  # Path 2: Profile fingerprint similarity
+PATH3_MIN_MATCHES = 10  # Path 3: Min similar snapshots from same device (vector search)
+PATH3_SIMILARITY_THRESHOLD = 0.95  # Path 3: Cosine similarity threshold for matching
+OUTLIER_SIGMA_THRESHOLD = 4.0  # Path 1: Z-score for statistical outliers
+OUTLIER_COUNT_THRESHOLD = 2  # Path 1: Min outlier metrics to flag
 
 
 def connect_scylla():
@@ -74,40 +77,33 @@ def get_device_profile(session, device_id: str) -> Optional[Dict]:
     }
 
 
-def get_recent_snapshots(session, device_id: str, hours_back: int = 1, only_new: bool = False):
-    """Get recent snapshots for a device.
+def get_latest_snapshot(session, device_id: str, only_new: bool = False):
+    """Get the most recent snapshot for a device.
     
     Args:
-        only_new: If True, only return snapshots with is_anomalous=false (not yet analyzed)
+        only_new: If True, only return if snapshot hasn't been analyzed yet
     """
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(hours=hours_back)
-    
-    snapshots = []
-    
-    # Query current day
-    current_date = end_time.strftime('%Y-%m-%d')
+    # Query current day, ordered by time descending to get latest
+    current_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     query = """
         SELECT device_id, snapshot_time, embedding, metrics, is_anomalous, device_type
         FROM device_state_snapshots
         WHERE device_id = %s AND date = %s
-        AND snapshot_time >= %s
+        ORDER BY snapshot_time DESC
+        LIMIT 1
     """
     
-    result = session.execute(query, (device_id, current_date, start_time))
-    snapshots.extend(result)
+    result = session.execute(query, (device_id, current_date))
+    snapshot = result.one()
     
-    # If time range spans previous day, query that too
-    if start_time.date() < end_time.date():
-        prev_date = start_time.strftime('%Y-%m-%d')
-        result = session.execute(query, (device_id, prev_date, start_time))
-        snapshots.extend(result)
+    if not snapshot:
+        return None
     
-    # Filter to only new (unmarked) snapshots if requested
-    if only_new:
-        snapshots = [s for s in snapshots if not s.is_anomalous]
+    # If only_new requested, check if already analyzed
+    if only_new and snapshot.is_anomalous:
+        return None
     
-    return snapshots
+    return snapshot
 
 
 def find_similar_snapshots_vector_search(
@@ -267,83 +263,104 @@ def analyze_snapshot_with_vector_search(
     device_type: str,
     snapshot,
     profile: Dict,
-    similarity_threshold: float = SIMILARITY_THRESHOLD,
-    sigma_threshold: float = 3.0
+    profile_threshold: float = PROFILE_SIMILARITY_THRESHOLD,
+    path3_min_matches: int = PATH3_MIN_MATCHES,
+    sigma_threshold: float = OUTLIER_SIGMA_THRESHOLD,
+    outlier_count: int = OUTLIER_COUNT_THRESHOLD
 ) -> Dict:
     """
-    Analyze a snapshot using ScyllaDB Vector Search.
+    3-Path Anomaly Detection:
     
-    This demonstrates the actual vector search capability by:
-    1. Using ANN query to find similar normal snapshots
-    2. Computing similarity to profile
-    3. Checking if the device is behaving like its normal self
+    Path 1: Rules Engine - Statistical outliers (Z-score based)
+    Path 2: Profile Fingerprint - Similarity to device's historical baseline
+    Path 3: Peer Comparison - ANN query to see if pattern is common for THIS device
     """
-    # Use vector search to find similar snapshots in historical data
     date_str = snapshot.snapshot_time.strftime('%Y-%m-%d')
     
-    similar_snapshots = find_similar_snapshots_vector_search(
-        session,
-        snapshot.embedding,
-        device_id,
-        date_str,
-        limit=10
-    )
+    # PATH 3: Vector Search with Post-Query Filtering
+    # 1. Run ANN to get 100 nearest neighbors (globally, no WHERE clause)
+    # 2. Filter by device_id and similarity threshold in Python
+    # 3. If >= 10 matches: common pattern for this device = NORMAL
+    # 4. If < 10 matches: uncommon pattern = ANOMALY
     
-    # Count how many similar snapshots were normal (not anomalous)
-    similar_normal_count = sum(1 for s in similar_snapshots if not s['is_anomalous'])
+    path3_match_count = 0  # Default if ANN fails
     
-    # Compute similarity to profile
+    if snapshot.embedding and len(snapshot.embedding) > 0:
+        try:
+            # Query top 100 nearest neighbors globally
+            ann_query = """
+                SELECT device_id, snapshot_time, embedding
+                FROM device_state_snapshots
+                ORDER BY embedding ANN OF %s
+                LIMIT 100
+            """
+            ann_results = list(session.execute(ann_query, (snapshot.embedding,)))
+            
+            # Filter: same device + high similarity + not current snapshot
+            similar_from_device = []
+            for result in ann_results:
+                if result.device_id == device_id and result.snapshot_time != snapshot.snapshot_time:
+                    # Compute similarity
+                    sim = compute_cosine_similarity(snapshot.embedding, result.embedding)
+                    if sim >= PATH3_SIMILARITY_THRESHOLD:
+                        similar_from_device.append({'similarity': sim, 'time': result.snapshot_time})
+            
+            path3_match_count = len(similar_from_device)
+            
+        except Exception as e:
+            print(f"      Warning: ANN query failed: {e}")
+            path3_match_count = 0
+    
+    # PATH 2: Profile Fingerprint Similarity
     profile_similarity = compute_cosine_similarity(
         snapshot.embedding,
         profile['profile_embedding']
     )
     
-    # If we found similar normal behavior, compute average similarity
-    avg_similar_score = 0.0
-    if similar_normal_count > 0:
-        similar_scores = []
-        for sim_snap in similar_snapshots:
-            if not sim_snap['is_anomalous']:
-                score = compute_cosine_similarity(snapshot.embedding, sim_snap['embedding'])
-                similar_scores.append(score)
-        if similar_scores:
-            avg_similar_score = np.mean(similar_scores)
-    
-    # Check metric outliers
+    # PATH 1: Statistical Outlier Detection
     outlier_metrics = check_metric_outliers(
         snapshot.metrics,
         profile['metric_stats'],
         sigma_threshold=sigma_threshold
     )
     
-    # Determine if anomalous using embedding similarity only
-    # For demo purposes: disable statistical outlier detection due to high variance
-    # in simulated data. Only flag based on low vector similarity to profile.
-    is_anomalous = profile_similarity < similarity_threshold
+    # 3-PATH DECISION LOGIC
+    # Anomalous if ANY path triggers:
+    path1_triggered = len(outlier_metrics) >= outlier_count
+    path2_triggered = profile_similarity < profile_threshold
+    path3_triggered = path3_match_count < path3_min_matches
+    
+    is_anomalous = path1_triggered or path2_triggered or path3_triggered
     
     result = {
         'device_id': device_id,
         'snapshot_time': snapshot.snapshot_time,
         'profile_similarity': profile_similarity,
-        'avg_similar_score': avg_similar_score,
-        'similar_normal_count': similar_normal_count,
+        'path3_match_count': path3_match_count,
         'outlier_metrics': outlier_metrics,
         'is_anomalous': is_anomalous,
         'anomaly_reasons': [],
-        'used_vector_search': True
+        'path1_triggered': path1_triggered,
+        'path2_triggered': path2_triggered,
+        'path3_triggered': path3_triggered,
     }
     
-    # Add anomaly reasons
-    if profile_similarity < similarity_threshold:
-        result['anomaly_reasons'].append(
-            f"Low profile similarity: {profile_similarity:.3f} < {similarity_threshold}"
-        )
-    
-    if len(outlier_metrics) >= 3:
+    # Build anomaly reasons based on which paths triggered
+    if path1_triggered:
         outlier_names = list(outlier_metrics.keys())
         z_scores = [outlier_metrics[m]['z_score'] for m in outlier_names]
         result['anomaly_reasons'].append(
-            f"Extreme outliers ({len(outlier_metrics)} metrics): {', '.join(outlier_names[:3])} (Z-scores: {', '.join(f'{z:.1f}' for z in z_scores[:3])})"
+            f"PATH 1 (Rules): {len(outlier_metrics)} outliers - {', '.join(outlier_names[:3])} (Z: {', '.join(f'{z:.1f}' for z in z_scores[:3])})"
+        )
+    
+    if path2_triggered:
+        result['anomaly_reasons'].append(
+            f"PATH 2 (Profile): Low similarity {profile_similarity:.3f} < {profile_threshold}"
+        )
+    
+    if path3_triggered:
+        result['anomaly_reasons'].append(
+            f"PATH 3 (Vector): Uncommon pattern - only {path3_match_count} similar snapshots from this device (need {path3_min_matches}+, similarity >= {PATH3_SIMILARITY_THRESHOLD})"
         )
     
     return result
@@ -352,72 +369,77 @@ def analyze_snapshot_with_vector_search(
 def detect_anomalies_for_device(
     session,
     device_id: str,
-    hours_back: int = 1,
-    similarity_threshold: float = SIMILARITY_THRESHOLD,
+    profile_threshold: float = PROFILE_SIMILARITY_THRESHOLD,
+    path3_min_matches: int = PATH3_MIN_MATCHES,
     record_events: bool = True,
     only_new: bool = False
-) -> list:
+) -> Optional[Dict]:
     """
-    Detect anomalies for a single device using vector search.
+    Detect anomalies for the LATEST snapshot of a single device.
     
     Args:
-        only_new: If True, only analyze snapshots that haven't been checked yet
+        only_new: If True, only analyze if snapshot hasn't been checked yet
+    
+    Returns:
+        Result dict or None if no snapshot to analyze
     """
     # Get device profile
     profile = get_device_profile(session, device_id)
     if not profile:
-        return []
+        return None
     
     device_type = profile['device_type']
     
-    # Get recent snapshots (optionally only new/unanalyzed ones)
-    snapshots = get_recent_snapshots(session, device_id, hours_back=hours_back, only_new=only_new)
+    # Get ONLY the latest snapshot
+    snapshot = get_latest_snapshot(session, device_id, only_new=only_new)
     
-    if not snapshots:
-        return []
+    if not snapshot:
+        return None
     
-    if len(snapshots) > 0:
-        print(f"  🔍 {device_id}: Analyzing {len(snapshots)} snapshot(s)...")
+    if not snapshot.embedding:
+        print(f"  ⚠️  {device_id}: Latest snapshot has no embedding")
+        return None
     
-    # Analyze each snapshot using vector search
-    results = []
-    anomalies_found = 0
+    print(f"  🔍 {device_id}: Analyzing latest snapshot at {snapshot.snapshot_time}")
     
-    for snapshot in snapshots:
-        if not snapshot.embedding:
-            continue
+    # Analyze the snapshot
+    result = analyze_snapshot_with_vector_search(
+        session,
+        device_id,
+        device_type,
+        snapshot,
+        profile,
+        profile_threshold=profile_threshold,
+        path3_min_matches=path3_min_matches
+    )
+    
+    # Record anomaly if detected
+    if result['is_anomalous']:
+        print(f"     🚨 ANOMALY DETECTED!")
+        for reason in result['anomaly_reasons']:
+            print(f"        - {reason}")
         
-        result = analyze_snapshot_with_vector_search(
-            session,
-            device_id,
-            device_type,
-            snapshot,
-            profile,
-            similarity_threshold=similarity_threshold
-        )
-        
-        results.append(result)
-        
-        if result['is_anomalous']:
-            anomalies_found += 1
-            
-            # Record anomaly event
-            if record_events and not snapshot.is_anomalous:
-                record_anomaly(
-                    session,
-                    device_id,
-                    device_type,
-                    snapshot.snapshot_time,
-                    result['profile_similarity'],
-                    result['outlier_metrics'],
-                    result['similar_normal_count']
-                )
+        if record_events and not snapshot.is_anomalous:
+            record_anomaly(
+                session,
+                device_id,
+                device_type,
+                snapshot.snapshot_time,
+                result['profile_similarity'],
+                result['outlier_metrics'],
+                result['path3_match_count']
+            )
+    else:
+        print(f"     ✅ Normal (Profile sim: {result['profile_similarity']:.3f})")
     
-    # Print summary (only if we found something)
-    if anomalies_found > 0:
-        print(f"     🚨 Found {anomalies_found} anomal{'y' if anomalies_found == 1 else 'ies'}!")
-    
-    return results
+    return result
+
+
+def get_all_profiled_devices(session) -> List[str]:
+    """Get list of all devices that have profiles."""
+    query = "SELECT device_id FROM device_profiles"
+    result = session.execute(query)
+    return [row.device_id for row in result]
 
 
 def main():
@@ -427,14 +449,8 @@ def main():
     parser.add_argument(
         '--devices',
         nargs='+',
-        default=['RTU-001', 'MAU-001', 'CH-001', 'CT-001', 'AC-001'],
-        help='Device IDs to analyze (default: all known devices)'
-    )
-    parser.add_argument(
-        '--hours-back',
-        type=int,
-        default=1,
-        help='Hours of recent snapshots to analyze (default: 1)'
+        default=None,
+        help='Device IDs to analyze (default: auto-discover from device_profiles table)'
     )
     parser.add_argument(
         '--only-new',
@@ -442,16 +458,22 @@ def main():
         help='Only analyze snapshots not yet marked (for continuous mode)'
     )
     parser.add_argument(
-        '--similarity-threshold',
+        '--profile-threshold',
         type=float,
-        default=SIMILARITY_THRESHOLD,
-        help=f'Similarity threshold for anomaly detection (default: {SIMILARITY_THRESHOLD}, lower = stricter)'
+        default=PROFILE_SIMILARITY_THRESHOLD,
+        help=f'Profile similarity threshold (Path 2) (default: {PROFILE_SIMILARITY_THRESHOLD})'
+    )
+    parser.add_argument(
+        '--path3-min-matches',
+        type=int,
+        default=PATH3_MIN_MATCHES,
+        help=f'Min similar snapshots from same device (Path 3) (default: {PATH3_MIN_MATCHES})'
     )
     parser.add_argument(
         '--sigma-threshold',
         type=float,
-        default=SIGMA_THRESHOLD,
-        help=f'Standard deviations for metric outlier detection (default: {SIGMA_THRESHOLD}, higher = less sensitive)'
+        default=OUTLIER_SIGMA_THRESHOLD,
+        help=f'Standard deviations for metric outlier detection (Path 1) (default: {OUTLIER_SIGMA_THRESHOLD})'
     )
     parser.add_argument(
         '--no-record',
@@ -466,19 +488,24 @@ def main():
     
     args = parser.parse_args()
     
+    # Connect to ScyllaDB first to discover devices if needed
+    session = connect_scylla()
+    
+    # Auto-discover devices if not specified
+    if args.devices is None:
+        args.devices = get_all_profiled_devices(session)
+        print("🔍 Auto-discovered devices from profiles table")
+    
     print("=" * 70)
-    print("🔍 Anomaly Detection with ScyllaDB Vector Search (ANN Queries)")
+    print("🔍 3-Path Anomaly Detection with ScyllaDB Vector Search")
     print("=" * 70)
     print(f"\nDevices: {', '.join(args.devices)}")
-    print(f"Time window: {args.hours_back} hour(s)")
-    print(f"Similarity threshold: {args.similarity_threshold}")
-    print(f"Sigma threshold: {args.sigma_threshold}")
-    print(f"Record events: {not args.no_record}")
+    print(f"Mode: Analyze LATEST snapshot only")
+    print(f"\nPath 1 (Rules): Outliers with Z > {args.sigma_threshold}, count >= {OUTLIER_COUNT_THRESHOLD}")
+    print(f"Path 2 (Profile): Similarity < {args.profile_threshold}")
+    print(f"Path 3 (Vector): Similar snapshots from device < {args.path3_min_matches} (similarity >= {PATH3_SIMILARITY_THRESHOLD})")
+    print(f"\nRecord events: {not args.no_record}")
     print(f"Only new snapshots: {args.only_new}")
-    print(f"Uses: ORDER BY embedding ANN OF <vector> queries")
-    
-    # Connect to ScyllaDB
-    session = connect_scylla()
     print("\n✅ Connected to ScyllaDB")
     
     def run_detection():
@@ -487,22 +514,25 @@ def main():
         total_checked = 0
         
         for device_id in args.devices:
-            results = detect_anomalies_for_device(
+            result = detect_anomalies_for_device(
                 session,
                 device_id,
-                hours_back=args.hours_back,
-                similarity_threshold=args.similarity_threshold,
+                profile_threshold=args.profile_threshold,
+                path3_min_matches=args.path3_min_matches,
                 record_events=not args.no_record,
                 only_new=args.only_new
             )
-            all_results.extend(results)
-            total_anomalies += sum(1 for r in results if r['is_anomalous'])
-            total_checked += len(results)
+            
+            if result:
+                all_results.append(result)
+                if result['is_anomalous']:
+                    total_anomalies += 1
+                total_checked += 1
         
-        # Summary (only print if we checked something)
+        # Summary
         if total_checked > 0:
             timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
-            print(f"[{timestamp}] Checked {total_checked} snapshots → {total_anomalies} anomal{'y' if total_anomalies == 1 else 'ies'}")
+            print(f"\n[{timestamp}] Checked {total_checked} device(s) → {total_anomalies} anomal{'y' if total_anomalies == 1 else 'ies'}")
         
         return total_anomalies
     

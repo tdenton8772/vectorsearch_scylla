@@ -274,9 +274,10 @@ class IoTConsumer:
     
     def check_and_write_snapshots(self):
         """
-        Check ScyllaDB buffer for completed aggregation windows and write snapshots.
+        Check for completed aggregation windows and write snapshots.
         
-        A window is "complete" if it's older than aggregation_window + grace period.
+        For each window, groups metrics by exact timestamp and emits
+        one snapshot per unique timestamp (not one per window).
         """
         try:
             now = datetime.now(timezone.utc)
@@ -291,42 +292,62 @@ class IoTConsumer:
             
             for device_id, window_start in windows_to_process:
                 try:
-                    # Get all metrics for this window
-                    metrics_rows = self.scylla_session.execute(
-                        self.query_buffer_metrics,
-                        (device_id, window_start)
-                    )
+                    # Query raw metrics from device_metrics_raw within this window
+                    window_end = window_start + timedelta(seconds=self.aggregation_window)
+                    date_str = window_start.strftime('%Y-%m-%d')
                     
-                    metrics_list = list(metrics_rows)
-                    if not metrics_list:
-                        # Window already processed or empty
+                    query = """
+                        SELECT timestamp, metric_name, metric_value, device_type, location, building_id
+                        FROM device_metrics_raw
+                        WHERE device_id = %s AND date = %s
+                        AND timestamp >= %s AND timestamp < %s
+                    """
+                    
+                    raw_metrics = list(self.scylla_session.execute(
+                        query,
+                        (device_id, date_str, window_start, window_end)
+                    ))
+                    
+                    if not raw_metrics:
                         self.active_windows.discard((device_id, window_start))
                         continue
                     
-                    # Extract metadata from first row
-                    first_row = metrics_list[0]
-                    device_type = first_row.device_type
-                    location = first_row.location
-                    building_id = first_row.building_id
+                    # Group metrics by exact timestamp
+                    from collections import defaultdict
+                    timestamp_groups = defaultdict(list)
                     
-                    # Build metrics dict
-                    metrics = {r.metric_name: r.metric_value for r in metrics_list}
+                    for row in raw_metrics:
+                        timestamp_groups[row.timestamp].append(row)
                     
-                    # Build device state
-                    device_state = {
-                        'device_id': device_id,
-                        'device_type': device_type,
-                        'location': location,
-                        'building_id': building_id,
-                        'window_start': window_start,
-                        'metrics': metrics
-                    }
-                    
-                    # Generate embedding
-                    embedding = self.generate_embedding_ollama(device_state)
-                    
-                    # Write to ScyllaDB
-                    self.write_snapshot(device_state, embedding)
+                    # Create one snapshot per unique timestamp
+                    for timestamp, metrics_rows in timestamp_groups.items():
+                        first_row = metrics_rows[0]
+                        device_type = first_row.device_type
+                        location = first_row.location
+                        building_id = first_row.building_id
+                        
+                        # Build metrics dict
+                        metrics = {r.metric_name: r.metric_value for r in metrics_rows}
+                        
+                        # Build device state
+                        device_state = {
+                            'device_id': device_id,
+                            'device_type': device_type,
+                            'location': location,
+                            'building_id': building_id,
+                            'snapshot_time': timestamp,
+                            'metrics': metrics
+                        }
+                        
+                        # Generate embedding
+                        embedding = self.generate_embedding_ollama(device_state)
+                        
+                        # Write to ScyllaDB
+                        self.write_snapshot(device_state, embedding)
+                        
+                        logger.debug(
+                            f"✅ Snapshot: {device_id} @ {timestamp.isoformat()} ({len(metrics)} metrics)"
+                        )
                     
                     # Delete from buffer (processed)
                     self.scylla_session.execute(
@@ -338,8 +359,8 @@ class IoTConsumer:
                     self.active_windows.discard((device_id, window_start))
                     
                     logger.info(
-                        f"✅ Snapshot written: {device_id} @ {window_start.isoformat()} "
-                        f"({len(metrics)} metrics)"
+                        f"✅ Window processed: {device_id} @ {window_start.isoformat()} "
+                        f"({len(timestamp_groups)} snapshots from {len(raw_metrics)} metrics)"
                     )
                     
                 except Exception as e:
@@ -353,8 +374,8 @@ class IoTConsumer:
     def write_snapshot(self, device_state: Dict, embedding: List[float]):
         """Write aggregated device state snapshot to ScyllaDB."""
         try:
-            window_start = device_state['window_start']
-            date_str = window_start.strftime('%Y-%m-%d')
+            snapshot_time = device_state['snapshot_time']
+            date_str = snapshot_time.strftime('%Y-%m-%d')
             
             # For now, anomaly detection is simple (placeholder)
             anomaly_score = 0.0
@@ -365,7 +386,7 @@ class IoTConsumer:
                 (
                     device_state['device_id'],
                     date_str,
-                    window_start,
+                    snapshot_time,
                     device_state['device_type'],
                     device_state['location'],
                     device_state['building_id'],
