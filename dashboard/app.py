@@ -451,7 +451,8 @@ def get_anomaly_events(device_id: str, hours_back: int):
         for date_str in dates:
             result = session.execute(
                 """
-                SELECT detected_at, anomaly_score, anomaly_type, metrics_snapshot
+                SELECT detected_at, anomaly_score, anomaly_type, metrics_snapshot,
+                       path1_rules_triggered, path2_fingerprint_triggered, path3_vector_triggered, detection_details
                 FROM anomaly_events
                 WHERE device_id = %s AND date = %s AND detected_at >= %s
                 ORDER BY detected_at ASC
@@ -484,20 +485,37 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
     anomaly_map = {}
     if anomalies:
         for anom in anomalies:
-            # Create reason string from metrics_snapshot
-            reasons = []
-            if anom.metrics_snapshot:
-                similarity = anom.metrics_snapshot.get('similarity_score')
-                if similarity and similarity < 0.75:
-                    reasons.append(f"Low similarity: {similarity:.3f}")
-                
-                # Find outlier metrics
-                outliers = [k.replace('outlier_', '') for k in anom.metrics_snapshot.keys() 
-                           if k.startswith('outlier_')]
-                if outliers:
-                    reasons.append(f"Outliers: {', '.join(outliers[:3])}")
+            # Build detection path badges
+            path_badges = []
+            if getattr(anom, 'path1_rules_triggered', False):
+                path_badges.append('📊 Rules')
+            if getattr(anom, 'path2_fingerprint_triggered', False):
+                path_badges.append('🔍 Fingerprint')
+            if getattr(anom, 'path3_vector_triggered', False):
+                path_badges.append('🎯 Vector Search')
             
-            reason_text = '; '.join(reasons) if reasons else 'Anomalous behavior detected'
+            # Use detection_details if available, otherwise build from metrics
+            if hasattr(anom, 'detection_details') and anom.detection_details:
+                reason_text = anom.detection_details
+            else:
+                # Fallback to old logic
+                reasons = []
+                if anom.metrics_snapshot:
+                    similarity = anom.metrics_snapshot.get('similarity_score')
+                    if similarity and similarity < 0.75:
+                        reasons.append(f"Low similarity: {similarity:.3f}")
+                    
+                    outliers = [k.replace('outlier_', '') for k in anom.metrics_snapshot.keys() 
+                               if k.startswith('outlier_')]
+                    if outliers:
+                        reasons.append(f"Outliers: {', '.join(outliers[:3])}")
+                
+                reason_text = '; '.join(reasons) if reasons else 'Anomalous behavior detected'
+            
+            # Add path badges to reason
+            if path_badges:
+                reason_text = f"{' '.join(path_badges)}<br>{reason_text}"
+            
             anomaly_map[anom.detected_at] = {
                 'score': anom.anomaly_score,
                 'type': anom.anomaly_type,

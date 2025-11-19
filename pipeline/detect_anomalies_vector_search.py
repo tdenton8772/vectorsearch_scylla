@@ -206,7 +206,11 @@ def check_metric_outliers(snapshot_metrics: Dict, profile_stats: Dict,
 
 def record_anomaly(session, device_id: str, device_type: str, snapshot_time: datetime,
                    similarity_score: float, outlier_metrics: Dict,
-                   similar_count: int = 0):
+                   similar_count: int = 0,
+                   path1_triggered: bool = False,
+                   path2_triggered: bool = False,
+                   path3_triggered: bool = False,
+                   anomaly_reasons: list = None):
     """Record an anomaly event in ScyllaDB."""
     import uuid
     
@@ -224,18 +228,23 @@ def record_anomaly(session, device_id: str, device_type: str, snapshot_time: dat
     for metric_name, outlier_info in outlier_metrics.items():
         metrics_snapshot[f'outlier_{metric_name}'] = float(outlier_info['z_score'])
     
-    # Insert into anomaly_events with correct schema
+    # Build detection details string
+    detection_details = '; '.join(anomaly_reasons) if anomaly_reasons else 'Unknown'
+    
+    # Insert into anomaly_events with detection path tracking
     insert_event = """
         INSERT INTO anomaly_events
         (device_id, date, anomaly_id, device_type, detected_at, snapshot_time,
-         anomaly_score, anomaly_type, metrics_snapshot, resolution_status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         anomaly_score, anomaly_type, metrics_snapshot, resolution_status,
+         path1_rules_triggered, path2_fingerprint_triggered, path3_vector_triggered, detection_details)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     
     session.execute(
         insert_event,
         (device_id, date_str, uuid.uuid1(), device_type, snapshot_time, snapshot_time,
-         anomaly_score, 'vector_search', metrics_snapshot, 'open')
+         anomaly_score, 'multi_path', metrics_snapshot, 'open',
+         path1_triggered, path2_triggered, path3_triggered, detection_details)
     )
     
     # Update device statistics counter
@@ -427,7 +436,11 @@ def detect_anomalies_for_device(
                 snapshot.snapshot_time,
                 result['profile_similarity'],
                 result['outlier_metrics'],
-                result['path3_match_count']
+                result['path3_match_count'],
+                path1_triggered=result['path1_triggered'],
+                path2_triggered=result['path2_triggered'],
+                path3_triggered=result['path3_triggered'],
+                anomaly_reasons=result['anomaly_reasons']
             )
     else:
         print(f"     ✅ Normal (Profile sim: {result['profile_similarity']:.3f})")
