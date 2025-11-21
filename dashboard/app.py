@@ -449,17 +449,24 @@ def get_anomaly_events(device_id: str, hours_back: int):
         
         anomalies = []
         for date_str in dates:
+            # Query by partition key only - can't filter by detected_at without ALLOW FILTERING
             result = session.execute(
                 """
                 SELECT detected_at, anomaly_score, anomaly_type, metrics_snapshot,
                        path1_rules_triggered, path2_fingerprint_triggered, path3_vector_triggered, detection_details
                 FROM anomaly_events
-                WHERE device_id = %s AND date = %s AND detected_at >= %s
-                ORDER BY detected_at ASC
+                WHERE device_id = %s AND date = %s
                 """,
-                (device_id, date_str, start_time)
+                (device_id, date_str)
             )
-            anomalies.extend(result)
+            # Filter in Python for time range
+            for row in result:
+                # Handle timezone-aware comparison
+                detected = row.detected_at
+                if detected.tzinfo is None:
+                    detected = detected.replace(tzinfo=timezone.utc)
+                if detected >= start_time:
+                    anomalies.append(row)
         
         return anomalies
     except Exception as e:
@@ -484,6 +491,7 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
     # Build anomaly lookup by timestamp
     anomaly_map = {}
     if anomalies:
+        print(f"🔍 Building anomaly map for {device_id}: {len(anomalies)} anomalies")
         for anom in anomalies:
             # Build detection path badges
             path_badges = []
@@ -496,7 +504,9 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
             
             # Use detection_details if available, otherwise build from metrics
             if hasattr(anom, 'detection_details') and anom.detection_details:
-                reason_text = anom.detection_details
+                # Format detection_details with proper line breaks
+                # Replace common delimiters with <br> for better readability
+                reason_text = anom.detection_details.replace('; ', '<br>').replace(' | ', '<br>')
             else:
                 # Fallback to old logic
                 reasons = []
@@ -510,17 +520,21 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
                     if outliers:
                         reasons.append(f"Outliers: {', '.join(outliers[:3])}")
                 
-                reason_text = '; '.join(reasons) if reasons else 'Anomalous behavior detected'
+                reason_text = '<br>'.join(reasons) if reasons else 'Anomalous behavior detected'
             
-            # Add path badges to reason
+            # Add path badges on separate line before reason
             if path_badges:
-                reason_text = f"{' '.join(path_badges)}<br>{reason_text}"
+                reason_text = f"<b>{' '.join(path_badges)}</b><br>{reason_text}"
             
-            anomaly_map[anom.detected_at] = {
+            # Round detected_at to nearest 10 seconds to match snapshot times
+            # Snapshots are taken every 10 seconds, so round to align
+            detected_rounded = anom.detected_at.replace(second=(anom.detected_at.second // 10) * 10, microsecond=0)
+            anomaly_map[detected_rounded] = {
                 'score': anom.anomaly_score,
                 'type': anom.anomaly_type,
                 'reason': reason_text
             }
+            print(f"  Added to map: {detected_rounded} -> score={anom.anomaly_score:.3f}, reason_len={len(reason_text)}")
     
     # Create a small graph per metric
     graphs = []
@@ -545,17 +559,22 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
         if anomaly_times:
             # Build hover text for anomaly points
             hover_texts = []
+            print(f"  Building hover texts for {metric}: {len(anomaly_times)} anomaly times, map has {len(anomaly_map)} entries")
             for t in anomaly_times:
-                if t in anomaly_map:
-                    anom_info = anomaly_map[t]
+                # Round to nearest 10 seconds to match anomaly_map keys
+                t_rounded = t.replace(second=(t.second // 10) * 10, microsecond=0)
+                if t_rounded in anomaly_map:
+                    anom_info = anomaly_map[t_rounded]
+                    # Extract just the path badges (first part before details)
+                    reason_parts = anom_info['reason'].split('PATH')
+                    path_only = reason_parts[0].replace('<br>', '').replace('<b>', '').replace('</b>', '').strip()
                     hover_texts.append(
-                        f"⚠️ ANOMALY<br>" +
-                        f"Time: {t.strftime('%H:%M:%S')}<br>" +
-                        f"Score: {anom_info['score']:.3f}<br>" +
-                        f"{anom_info['reason']}"
+                        f"⚠️ ANOMALY\n" +
+                        f"Time: {t.strftime('%H:%M:%S')}\n" +
+                        f"{path_only}"
                     )
                 else:
-                    hover_texts.append(f"⚠️ ANOMALY<br>Time: {t.strftime('%H:%M:%S')}")
+                    hover_texts.append(f"⚠️ ANOMALY\nTime: {t.strftime('%H:%M:%S')}")
             
             fig.add_trace(go.Scatter(
                 x=anomaly_times,
@@ -568,7 +587,7 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
                     symbol='x',
                     line=dict(width=2, color='#c0392b')
                 ),
-                hovertext=hover_texts,
+                text=hover_texts,
                 hoverinfo='text'
             ))
         

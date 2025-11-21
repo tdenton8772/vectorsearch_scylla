@@ -26,11 +26,11 @@ scylla_password = os.getenv('SCYLLA_PASSWORD')
 scylla_keyspace = os.getenv('SCYLLA_KEYSPACE', 'iot_monitoring')
 
 # Anomaly detection thresholds - 3-path approach
-PROFILE_SIMILARITY_THRESHOLD = 0.90  # Path 2: Profile fingerprint similarity
-PATH3_MIN_MATCHES = 10  # Path 3: Min similar snapshots from same device (vector search)
-PATH3_SIMILARITY_THRESHOLD = 0.95  # Path 3: Cosine similarity threshold for matching
-OUTLIER_SIGMA_THRESHOLD = 4.0  # Path 1: Z-score for statistical outliers
-OUTLIER_COUNT_THRESHOLD = 2  # Path 1: Min outlier metrics to flag
+PROFILE_SIMILARITY_THRESHOLD = 0.75  # Path 2: Profile fingerprint similarity (relaxed)
+PATH3_MIN_MATCHES = 5  # Path 3: Min similar snapshots from same device (relaxed)
+PATH3_SIMILARITY_THRESHOLD = 0.90  # Path 3: Cosine similarity threshold for matching (relaxed)
+OUTLIER_SIGMA_THRESHOLD = 6.0  # Path 1: Z-score for statistical outliers (relaxed)
+OUTLIER_COUNT_THRESHOLD = 4  # Path 1: Min outlier metrics to flag (relaxed)
 
 
 def connect_scylla():
