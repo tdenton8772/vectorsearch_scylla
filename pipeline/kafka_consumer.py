@@ -27,13 +27,14 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 from collections import defaultdict
 
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, TopicPartition
 from kafka.errors import KafkaError
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import BatchStatement, ConsistencyLevel
 import ollama
 from dotenv import load_dotenv
+from anomaly_detection import detect_anomaly_paths_1_2
 
 load_dotenv()
 
@@ -63,7 +64,8 @@ class IoTConsumer:
         scylla_username: str = None,
         scylla_password: str = None,
         scylla_keyspace: str = 'iot_monitoring',
-        embedding_method: str = 'ollama_text'
+        embedding_method: str = 'ollama_text',
+        lookback_minutes: int = 5,
     ):
         """
         Initialize consumer.
@@ -85,6 +87,7 @@ class IoTConsumer:
         self.aggregation_window = aggregation_window
         self.embedding_method = embedding_method
         self.scylla_keyspace = scylla_keyspace
+        self.lookback_minutes = lookback_minutes
         
         # Connect to Kafka
         logger.info(f"Connecting to Kafka: {kafka_brokers}, topic: {kafka_topic}")
@@ -102,6 +105,39 @@ class IoTConsumer:
             heartbeat_interval_ms=10000
         )
         logger.info(f"✅ Kafka consumer initialized (group: {consumer_group})")
+        
+        # Seek to at-most N minutes lookback on startup
+        try:
+            # Ensure we have an assignment
+            self.consumer.poll(timeout_ms=1000)
+            assignment = self.consumer.assignment()
+            if not assignment:
+                # Try again briefly
+                self.consumer.poll(timeout_ms=2000)
+                assignment = self.consumer.assignment()
+            if assignment:
+                ts_ms = int((datetime.now(timezone.utc) - timedelta(minutes=self.lookback_minutes)).timestamp() * 1000)
+                query = {tp: ts_ms for tp in assignment}
+                offsets = self.consumer.offsets_for_times(query)
+                # Seek per partition ONLY if no committed offset exists
+                for tp in assignment:
+                    committed = self.consumer.committed(tp)
+                    if committed is None:
+                        off_ts = offsets.get(tp)
+                        if off_ts and off_ts.offset is not None:
+                            self.consumer.seek(tp, off_ts.offset)
+                            logger.info(f"⏮️  Seek {tp.topic}-{tp.partition} to offset {off_ts.offset} (~{self.lookback_minutes}m back, no committed offset)")
+                        else:
+                            # No messages in that range -> go to end (start from latest)
+                            self.consumer.seek_to_end(tp)
+                            endpos = self.consumer.position(tp)
+                            logger.info(f"⏭️  Seek {tp.topic}-{tp.partition} to end (offset {endpos}) — no committed offset and no data within {self.lookback_minutes}m")
+                    else:
+                        logger.info(f"↪️  Using committed offset for {tp.topic}-{tp.partition}: {committed}")
+            else:
+                logger.warning("No partition assignment yet; will use committed offsets with auto_offset_reset=latest")
+        except Exception as e:
+            logger.warning(f"Lookback seek skipped due to error: {e}")
         
         # Connect to ScyllaDB
         logger.info(f"Connecting to ScyllaDB: {scylla_hosts}")
@@ -132,8 +168,12 @@ class IoTConsumer:
             'messages_consumed': 0,
             'raw_metrics_written': 0,
             'snapshots_written': 0,
+            'anomalies_detected': 0,
             'errors': 0
         }
+        
+        # Cache for device profiles
+        self.device_profiles_cache = {}
     
     def _prepare_statements(self):
         """Prepare CQL statements for better performance."""
@@ -175,6 +215,44 @@ class IoTConsumer:
         """)
         
         logger.info("✅ CQL statements prepared")
+
+    def _record_anomaly_event(self, device_id: str, device_type: str, snapshot_time: datetime, result):
+        """Insert anomaly event for UI tooltip visibility (Path 1/2)."""
+        try:
+            import uuid
+            date_str = snapshot_time.strftime('%Y-%m-%d')
+            insert_event = """
+                INSERT INTO anomaly_events
+                (device_id, date, anomaly_id, device_type, detected_at, snapshot_time,
+                 anomaly_score, anomaly_type, metrics_snapshot, resolution_status,
+                 path1_rules_triggered, path2_fingerprint_triggered, path3_vector_triggered, detection_details)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            metrics_snapshot = {
+                'similarity_to_profile': float(result.similarity_to_profile),
+                'outlier_count': float(len(result.outliers))
+            }
+            self.scylla_session.execute(
+                insert_event,
+                (
+                    device_id,
+                    date_str,
+                    uuid.uuid1(),
+                    device_type,
+                    snapshot_time,
+                    snapshot_time,
+                    float(result.anomaly_score),
+                    'consumer_paths_1_2',
+                    metrics_snapshot,
+                    'open',
+                    bool(result.path1_triggered),
+                    bool(result.path2_triggered),
+                    False,
+                    result.detection_details or ''
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write anomaly_event for {device_id}@{snapshot_time}: {e}")
     
     def _get_window_start(self, timestamp: datetime) -> datetime:
         """Get the start of the aggregation window for a timestamp."""
@@ -240,24 +318,24 @@ class IoTConsumer:
         """
         Generate embedding from device state using Ollama.
         
-        Converts device state to natural language text, then embeds.
+        Only includes device_id and metric values to ensure embeddings
+        focus on operational state changes, not static metadata.
         """
         try:
-            # Convert device state to natural language
+            # Only use device_id and metrics (not device_type, location, building_id)
             device_id = device_state['device_id']
-            device_type = device_state['device_type']
             metrics = device_state['metrics']
             
-            # Build text representation
-            text_parts = [f"{device_id} {device_type}"]
+            # Build text representation with just device_id prefix and metrics
+            text_parts = [device_id]
             for metric_name, metric_value in sorted(metrics.items()):
-                # Format nicely
+                # Format metric values
                 if isinstance(metric_value, float):
-                    text_parts.append(f"{metric_name} {metric_value:.2f}")
+                    text_parts.append(f"{metric_name}:{metric_value:.2f}")
                 else:
-                    text_parts.append(f"{metric_name} {metric_value}")
+                    text_parts.append(f"{metric_name}:{metric_value}")
             
-            text = ": " + ", ".join(text_parts)
+            text = " ".join(text_parts)
             
             # Generate embedding with Ollama
             response = ollama.embeddings(
@@ -329,7 +407,7 @@ class IoTConsumer:
                         # Build metrics dict
                         metrics = {r.metric_name: r.metric_value for r in metrics_rows}
                         
-                        # Build device state
+                        # Build device state for storage
                         device_state = {
                             'device_id': device_id,
                             'device_type': device_type,
@@ -339,8 +417,14 @@ class IoTConsumer:
                             'metrics': metrics
                         }
                         
+                        # Build minimal dict for embedding (only device_id + metrics)
+                        device_embedding_dict = {
+                            'device_id': device_id,
+                            'metrics': metrics
+                        }
+                        
                         # Generate embedding
-                        embedding = self.generate_embedding_ollama(device_state)
+                        embedding = self.generate_embedding_ollama(device_embedding_dict)
                         
                         # Write to ScyllaDB
                         self.write_snapshot(device_state, embedding)
@@ -371,16 +455,42 @@ class IoTConsumer:
             logger.error(f"Error checking/writing snapshots: {e}")
             self.stats['errors'] += 1
     
+    def _get_profile(self, device_id: str) -> Optional[Dict]:
+        """Load device profile from cache or database."""
+        if device_id in self.device_profiles_cache:
+            return self.device_profiles_cache[device_id]
+        
+        row = self.scylla_session.execute(
+            """
+            SELECT profile_embedding, metric_stats
+            FROM device_profiles WHERE device_id = %s
+            """,
+            (device_id,)
+        ).one()
+        
+        if not row:
+            return None
+        
+        profile = {
+            'embedding': row.profile_embedding,
+            'metric_stats': row.metric_stats,
+        }
+        self.device_profiles_cache[device_id] = profile
+        return profile
+
     def write_snapshot(self, device_state: Dict, embedding: List[float]):
-        """Write aggregated device state snapshot to ScyllaDB."""
+        """Write aggregated device state snapshot to ScyllaDB with inline anomaly detection (Path1/Path2)."""
         try:
             snapshot_time = device_state['snapshot_time']
             date_str = snapshot_time.strftime('%Y-%m-%d')
-            
-            # For now, anomaly detection is simple (placeholder)
-            anomaly_score = 0.0
-            is_anomalous = False
-            
+            device_id = device_state['device_id']
+            metrics = device_state['metrics']
+
+            # Load profile and run anomaly detection
+            profile = self._get_profile(device_id)
+            result = detect_anomaly_paths_1_2(metrics, embedding, profile)
+
+            # Insert snapshot
             self.scylla_session.execute(
                 self.insert_snapshot,
                 (
@@ -390,15 +500,29 @@ class IoTConsumer:
                     device_state['device_type'],
                     device_state['location'],
                     device_state['building_id'],
-                    device_state['metrics'],
+                    metrics,
                     embedding,
                     self.embedding_method,
-                    anomaly_score,
-                    is_anomalous
+                    result.anomaly_score,
+                    result.is_anomalous
                 )
             )
             self.stats['snapshots_written'] += 1
-            
+            if result.is_anomalous:
+                self.stats['anomalies_detected'] += 1
+                paths = []
+                if result.path1_triggered:
+                    paths.append('1')
+                if result.path2_triggered:
+                    paths.append('2')
+                path_str = ','.join(paths) if paths else '—'
+                logger.warning(
+                    f"🚨 ANOMALY [PATH {path_str}] {device_id} @ {snapshot_time.isoformat()} "
+                    f"score={result.anomaly_score:.3f} details={result.detection_details or 'n/a'}"
+                )
+                # Also write anomaly_events for UI tooltips
+                self._record_anomaly_event(device_id, device_state['device_type'], snapshot_time, result)
+
         except Exception as e:
             logger.error(f"Error writing snapshot: {e}")
             self.stats['errors'] += 1
@@ -439,6 +563,7 @@ class IoTConsumer:
                             f"Progress: {self.stats['messages_consumed']} consumed, "
                             f"{self.stats['raw_metrics_written']} raw written, "
                             f"{self.stats['snapshots_written']} snapshots, "
+                            f"{self.stats['anomalies_detected']} anomalies, "
                             f"{self.stats['errors']} errors"
                         )
                 
@@ -499,6 +624,12 @@ def main():
         default='ollama_text',
         help='Embedding method (default: ollama_text)'
     )
+    parser.add_argument(
+        '--lookback-minutes',
+        type=int,
+        default=5,
+        help='On startup, seek offsets to at most this many minutes in the past (default: 5)'
+    )
     
     args = parser.parse_args()
     
@@ -520,7 +651,8 @@ def main():
         scylla_username=scylla_username,
         scylla_password=scylla_password,
         scylla_keyspace=scylla_keyspace,
-        embedding_method=args.embedding_method
+        embedding_method=args.embedding_method,
+        lookback_minutes=args.lookback_minutes,
     )
     
     consumer.run()

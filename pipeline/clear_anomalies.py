@@ -63,7 +63,7 @@ for row in devices:
         (row.device_id,)
     ).one()
     
-    if result and result.anomaly_count > 0:
+    if result and result.anomaly_count is not None and result.anomaly_count > 0:
         # Subtract the count to reset to 0
         session.execute(
             "UPDATE device_statistics SET anomaly_count = anomaly_count - %s WHERE device_id = %s",

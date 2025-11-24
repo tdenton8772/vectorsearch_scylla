@@ -28,7 +28,7 @@ scylla_keyspace = os.getenv('SCYLLA_KEYSPACE', 'iot_monitoring')
 # Anomaly detection thresholds - 3-path approach
 PROFILE_SIMILARITY_THRESHOLD = 0.75  # Path 2: Profile fingerprint similarity (relaxed)
 PATH3_MIN_MATCHES = 5  # Path 3: Min similar snapshots from same device (relaxed)
-PATH3_SIMILARITY_THRESHOLD = 0.90  # Path 3: Cosine similarity threshold for matching (relaxed)
+PATH3_SIMILARITY_THRESHOLD = 0.75  # Path 3: Cosine similarity threshold for matching (relaxed)
 OUTLIER_SIGMA_THRESHOLD = 6.0  # Path 1: Z-score for statistical outliers (relaxed)
 OUTLIER_COUNT_THRESHOLD = 4  # Path 1: Min outlier metrics to flag (relaxed)
 
@@ -52,9 +52,7 @@ def connect_scylla():
 def get_device_profile(session, device_id: str) -> Optional[Dict]:
     """Get device profile from ScyllaDB."""
     query = """
-        SELECT device_type, location, building_id,
-               profile_embedding, metric_stats,
-               profile_created_at, profile_updated_at
+        SELECT profile_embedding, metric_stats
         FROM device_profiles
         WHERE device_id = %s
     """
@@ -66,44 +64,43 @@ def get_device_profile(session, device_id: str) -> Optional[Dict]:
         return None
     
     return {
-        'device_id': device_id,
-        'device_type': row.device_type,
-        'location': row.location,
-        'building_id': row.building_id,
         'profile_embedding': row.profile_embedding,
         'metric_stats': row.metric_stats,
-        'profile_created_at': row.profile_created_at,
-        'profile_updated_at': row.profile_updated_at
     }
 
 
-def get_latest_snapshot(session, device_id: str, only_new: bool = False):
-    """Get the most recent snapshot for a device.
+def get_unanalyzed_snapshots(session, device_id: str, minutes_back: int = 1) -> List:
+    """Get snapshots that haven't been analyzed by Path 3 yet.
+    
+    We need a separate way to track Path 3 analysis since the consumer
+    already sets is_anomalous based on Path 1 & 2.
+    
+    Strategy: Get recent snapshots and check if they have corresponding
+    entries in anomaly_events with path3_vector_triggered set.
     
     Args:
-        only_new: If True, only return if snapshot hasn't been analyzed yet
+        minutes_back: How many minutes back to check for new snapshots
     """
-    # Query current day, ordered by time descending to get latest
-    current_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    now = datetime.now(timezone.utc)
+    start_time = now - timedelta(minutes=minutes_back)
+    
+    # Get dates to query
+    today = now.strftime('%Y-%m-%d')
+    yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+    
     query = """
-        SELECT device_id, snapshot_time, embedding, metrics, is_anomalous, device_type
+        SELECT device_id, snapshot_time, embedding, metrics, is_anomalous, device_type, anomaly_score
         FROM device_state_snapshots
-        WHERE device_id = %s AND date = %s
+        WHERE device_id = %s AND date = %s AND snapshot_time >= %s
         ORDER BY snapshot_time DESC
-        LIMIT 1
     """
     
-    result = session.execute(query, (device_id, current_date))
-    snapshot = result.one()
+    snapshots = []
+    for date_str in [today, yesterday]:
+        result = session.execute(query, (device_id, date_str, start_time))
+        snapshots.extend(list(result))
     
-    if not snapshot:
-        return None
-    
-    # If only_new requested, check if already analyzed
-    if only_new and snapshot.is_anomalous:
-        return None
-    
-    return snapshot
+    return sorted(snapshots, key=lambda s: s.snapshot_time, reverse=True)
 
 
 def find_similar_snapshots_vector_search(
@@ -266,6 +263,79 @@ def record_anomaly(session, device_id: str, device_type: str, snapshot_time: dat
     )
 
 
+def analyze_snapshot_path3_only(
+    session,
+    device_id: str,
+    device_type: str,
+    snapshot,
+    path3_min_matches: int = PATH3_MIN_MATCHES
+) -> Dict:
+    """
+    Run ONLY Path 3 (Vector Search) analysis.
+    Path 1 & 2 are already done by the consumer.
+    """
+    # PATH 3: Vector Search with ANN Query
+    path3_match_count = 0
+    
+    if snapshot.embedding and len(snapshot.embedding) > 0:
+        try:
+            # Query top 100 nearest neighbors globally
+            ann_query = """
+                SELECT device_id, snapshot_time, embedding
+                FROM device_state_snapshots
+                ORDER BY embedding ANN OF %s
+                LIMIT 100
+            """
+            ann_results = list(session.execute(ann_query, (snapshot.embedding,)))
+            
+            # Filter: same device + high similarity + not current snapshot
+            similar_from_device = []
+            for result in ann_results:
+                if result.device_id == device_id and result.snapshot_time != snapshot.snapshot_time:
+                    # Compute similarity
+                    sim = compute_cosine_similarity(snapshot.embedding, result.embedding)
+                    if sim >= PATH3_SIMILARITY_THRESHOLD:
+                        similar_from_device.append({'similarity': sim, 'time': result.snapshot_time})
+            
+            path3_match_count = len(similar_from_device)
+            
+        except Exception as e:
+            print(f"      Warning: ANN query failed: {e}")
+            path3_match_count = 0
+    
+    path3_triggered = path3_match_count < path3_min_matches
+    
+    result = {
+        'device_id': device_id,
+        'snapshot_time': snapshot.snapshot_time,
+        'path3_match_count': path3_match_count,
+        'path3_triggered': path3_triggered,
+        'anomaly_reasons': []
+    }
+    
+    if path3_triggered:
+        result['anomaly_reasons'].append(
+            f"PATH 3 (Vector): Only {path3_match_count} similar snapshots found (need {path3_min_matches}+, similarity >= {PATH3_SIMILARITY_THRESHOLD})"
+        )
+    
+    return result
+
+
+def update_snapshot_path3(session, device_id: str, snapshot_time: datetime, result: Dict):
+    """Update snapshot with Path 3 detection result."""
+    date_str = snapshot_time.strftime('%Y-%m-%d')
+    
+    # Mark as anomalous if Path 3 triggered
+    session.execute(
+        """
+        UPDATE device_state_snapshots
+        SET is_anomalous = true
+        WHERE device_id = %s AND date = %s AND snapshot_time = %s
+        """,
+        (device_id, date_str, snapshot_time)
+    )
+
+
 def analyze_snapshot_with_vector_search(
     session,
     device_id: str,
@@ -381,71 +451,57 @@ def detect_anomalies_for_device(
     profile_threshold: float = PROFILE_SIMILARITY_THRESHOLD,
     path3_min_matches: int = PATH3_MIN_MATCHES,
     record_events: bool = True,
-    only_new: bool = False
-) -> Optional[Dict]:
+    minutes_back: int = 1
+) -> List[Dict]:
     """
-    Detect anomalies for the LATEST snapshot of a single device.
+    Run Path 3 (Vector Search) on recent unanalyzed snapshots.
     
     Args:
-        only_new: If True, only analyze if snapshot hasn't been checked yet
+        minutes_back: How many minutes of snapshots to process
     
     Returns:
-        Result dict or None if no snapshot to analyze
+        List of results for each snapshot analyzed
     """
     # Get device profile
     profile = get_device_profile(session, device_id)
     if not profile:
-        return None
+        return []
     
-    device_type = profile['device_type']
+    # Get recent snapshots that need Path 3 analysis
+    snapshots = get_unanalyzed_snapshots(session, device_id, minutes_back=minutes_back)
     
-    # Get ONLY the latest snapshot
-    snapshot = get_latest_snapshot(session, device_id, only_new=only_new)
+    if not snapshots:
+        return []
     
-    if not snapshot:
-        return None
+    results = []
+    print(f"  🔍 {device_id}: Analyzing {len(snapshots)} snapshot(s) for Path 3")
     
-    if not snapshot.embedding:
-        print(f"  ⚠️  {device_id}: Latest snapshot has no embedding")
-        return None
-    
-    print(f"  🔍 {device_id}: Analyzing latest snapshot at {snapshot.snapshot_time}")
-    
-    # Analyze the snapshot
-    result = analyze_snapshot_with_vector_search(
-        session,
-        device_id,
-        device_type,
-        snapshot,
-        profile,
-        profile_threshold=profile_threshold,
-        path3_min_matches=path3_min_matches
-    )
-    
-    # Record anomaly if detected
-    if result['is_anomalous']:
-        print(f"     🚨 ANOMALY DETECTED!")
-        for reason in result['anomaly_reasons']:
-            print(f"        - {reason}")
+    for snapshot in snapshots:
+        if not snapshot.embedding:
+            continue
         
-        if record_events and not snapshot.is_anomalous:
-            record_anomaly(
-                session,
-                device_id,
-                device_type,
-                snapshot.snapshot_time,
-                result['profile_similarity'],
-                result['outlier_metrics'],
-                result['path3_match_count'],
-                path1_triggered=result['path1_triggered'],
-                path2_triggered=result['path2_triggered'],
-                path3_triggered=result['path3_triggered'],
-                anomaly_reasons=result['anomaly_reasons']
-            )
-    else:
-        print(f"     ✅ Normal (Profile sim: {result['profile_similarity']:.3f})")
+        device_type = snapshot.device_type
+        
+        # ONLY run Path 3 vector search (Path 1 & 2 already done by consumer)
+        result = analyze_snapshot_path3_only(
+            session,
+            device_id,
+            device_type,
+            snapshot,
+            path3_min_matches=path3_min_matches
+        )
+        
+        # If Path 3 detects anomaly and snapshot wasn't already marked, update it
+        if result['path3_triggered']:
+            print(f"     🚨 PATH 3 ANOMALY: {snapshot.snapshot_time} - {result['anomaly_reasons'][0]}")
+            
+            if record_events:
+                # Update snapshot with Path 3 result
+                update_snapshot_path3(session, device_id, snapshot.snapshot_time, result)
+        
+        results.append(result)
     
-    return result
+    return results
 
 
 def get_all_profiled_devices(session) -> List[str]:
@@ -510,44 +566,39 @@ def main():
         print("🔍 Auto-discovered devices from profiles table")
     
     print("=" * 70)
-    print("🔍 3-Path Anomaly Detection with ScyllaDB Vector Search")
+    print("🔍 PATH 3 (Vector Search) Anomaly Detection")
     print("=" * 70)
     print(f"\nDevices: {', '.join(args.devices)}")
-    print(f"Mode: Analyze LATEST snapshot only")
-    print(f"\nPath 1 (Rules): Outliers with Z > {args.sigma_threshold}, count >= {OUTLIER_COUNT_THRESHOLD}")
-    print(f"Path 2 (Profile): Similarity < {args.profile_threshold}")
-    print(f"Path 3 (Vector): Similar snapshots from device < {args.path3_min_matches} (similarity >= {PATH3_SIMILARITY_THRESHOLD})")
+    print(f"Mode: Analyze recent snapshots (last 1 minute)")
+    print(f"\nPath 3 (Vector): Similar snapshots from device < {args.path3_min_matches} (similarity >= {PATH3_SIMILARITY_THRESHOLD})")
     print(f"\nRecord events: {not args.no_record}")
-    print(f"Only new snapshots: {args.only_new}")
+    print(f"\nNOTE: Path 1 & 2 are handled by the consumer in real-time")
     print("\n✅ Connected to ScyllaDB")
     
     def run_detection():
-        all_results = []
-        total_anomalies = 0
-        total_checked = 0
+        total_path3_anomalies = 0
+        total_snapshots_checked = 0
         
         for device_id in args.devices:
-            result = detect_anomalies_for_device(
+            results = detect_anomalies_for_device(
                 session,
                 device_id,
-                profile_threshold=args.profile_threshold,
                 path3_min_matches=args.path3_min_matches,
                 record_events=not args.no_record,
-                only_new=args.only_new
+                minutes_back=1  # Check last minute of snapshots
             )
             
-            if result:
-                all_results.append(result)
-                if result['is_anomalous']:
-                    total_anomalies += 1
-                total_checked += 1
+            if results:
+                total_snapshots_checked += len(results)
+                path3_anomalies = sum(1 for r in results if r['path3_triggered'])
+                total_path3_anomalies += path3_anomalies
         
         # Summary
-        if total_checked > 0:
+        if total_snapshots_checked > 0:
             timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
-            print(f"\n[{timestamp}] Checked {total_checked} device(s) → {total_anomalies} anomal{'y' if total_anomalies == 1 else 'ies'}")
+            print(f"\n[{timestamp}] Checked {total_snapshots_checked} snapshot(s) → {total_path3_anomalies} Path 3 anomal{'y' if total_path3_anomalies == 1 else 'ies'}")
         
-        return total_anomalies
+        return total_path3_anomalies
     
     if args.continuous:
         import time

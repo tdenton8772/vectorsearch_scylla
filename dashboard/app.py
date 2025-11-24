@@ -504,9 +504,8 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
             
             # Use detection_details if available, otherwise build from metrics
             if hasattr(anom, 'detection_details') and anom.detection_details:
-                # Format detection_details with proper line breaks
-                # Replace common delimiters with <br> for better readability
-                reason_text = anom.detection_details.replace('; ', '<br>').replace(' | ', '<br>')
+                # Format detection_details with proper line breaks for display
+                reason_text = anom.detection_details.replace('; ', '\n').replace(' | ', '\n')
             else:
                 # Fallback to old logic
                 reasons = []
@@ -514,27 +513,30 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
                     similarity = anom.metrics_snapshot.get('similarity_score')
                     if similarity and similarity < 0.75:
                         reasons.append(f"Low similarity: {similarity:.3f}")
-                    
-                    outliers = [k.replace('outlier_', '') for k in anom.metrics_snapshot.keys() 
-                               if k.startswith('outlier_')]
+                    outliers = [k.replace('outlier_', '') for k in anom.metrics_snapshot.keys() if k.startswith('outlier_')]
                     if outliers:
                         reasons.append(f"Outliers: {', '.join(outliers[:3])}")
-                
-                reason_text = '<br>'.join(reasons) if reasons else 'Anomalous behavior detected'
-            
-            # Add path badges on separate line before reason
-            if path_badges:
-                reason_text = f"<b>{' '.join(path_badges)}</b><br>{reason_text}"
-            
+                reason_text = '\n'.join(reasons) if reasons else 'Anomalous behavior detected'
+
+            # Build a clean source label for tooltips
+            source_labels = []
+            if getattr(anom, 'path1_rules_triggered', False):
+                source_labels.append('Rules')
+            if getattr(anom, 'path2_fingerprint_triggered', False):
+                source_labels.append('Fingerprint')
+            if getattr(anom, 'path3_vector_triggered', False):
+                source_labels.append('Vector Search')
+            source_text = ', '.join(source_labels) if source_labels else 'Unknown'
+
             # Round detected_at to nearest 10 seconds to match snapshot times
-            # Snapshots are taken every 10 seconds, so round to align
             detected_rounded = anom.detected_at.replace(second=(anom.detected_at.second // 10) * 10, microsecond=0)
             anomaly_map[detected_rounded] = {
                 'score': anom.anomaly_score,
                 'type': anom.anomaly_type,
-                'reason': reason_text
+                'source': source_text,
+                'details': reason_text
             }
-            print(f"  Added to map: {detected_rounded} -> score={anom.anomaly_score:.3f}, reason_len={len(reason_text)}")
+            print(f"  Added to map: {detected_rounded} -> score={anom.anomaly_score:.3f}, source={source_text}")
     
     # Create a small graph per metric
     graphs = []
@@ -565,16 +567,16 @@ def build_metric_graphs(device_id: str, rows: List[Dict], anomalies: List = None
                 t_rounded = t.replace(second=(t.second // 10) * 10, microsecond=0)
                 if t_rounded in anomaly_map:
                     anom_info = anomaly_map[t_rounded]
-                    # Extract just the path badges (first part before details)
-                    reason_parts = anom_info['reason'].split('PATH')
-                    path_only = reason_parts[0].replace('<br>', '').replace('<b>', '').replace('</b>', '').strip()
+                    source = anom_info.get('source', 'Unknown')
+                    details = anom_info.get('details')
+                    detail_line = f"\nDetails: {details}" if details else ''
                     hover_texts.append(
                         f"⚠️ ANOMALY\n" +
                         f"Time: {t.strftime('%H:%M:%S')}\n" +
-                        f"{path_only}"
+                        f"Source: {source}{detail_line}"
                     )
                 else:
-                    hover_texts.append(f"⚠️ ANOMALY\nTime: {t.strftime('%H:%M:%S')}")
+                    hover_texts.append(f"⚠️ ANOMALY\nTime: {t.strftime('%H:%M:%S')}\nSource: Unknown")
             
             fig.add_trace(go.Scatter(
                 x=anomaly_times,
