@@ -217,23 +217,26 @@ class IoTConsumer:
         logger.info("✅ CQL statements prepared")
 
     def _record_anomaly_event(self, device_id: str, device_type: str, snapshot_time: datetime, result):
-        """Insert anomaly event for UI tooltip visibility (Path 1/2)."""
+        """Insert anomaly event for UI tooltip visibility (Path 1/2).
+        Falls back to a minimal insert if the table lacks new columns.
+        """
+        import uuid
+        date_str = snapshot_time.strftime('%Y-%m-%d')
+        metrics_snapshot = {
+            'similarity_to_profile': float(result.similarity_to_profile),
+            'outlier_count': float(len(result.outliers))
+        }
+        # Preferred insert (with path flags + details)
         try:
-            import uuid
-            date_str = snapshot_time.strftime('%Y-%m-%d')
-            insert_event = """
+            insert_full = """
                 INSERT INTO anomaly_events
                 (device_id, date, anomaly_id, device_type, detected_at, snapshot_time,
                  anomaly_score, anomaly_type, metrics_snapshot, resolution_status,
                  path1_rules_triggered, path2_fingerprint_triggered, path3_vector_triggered, detection_details)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
-            metrics_snapshot = {
-                'similarity_to_profile': float(result.similarity_to_profile),
-                'outlier_count': float(len(result.outliers))
-            }
             self.scylla_session.execute(
-                insert_event,
+                insert_full,
                 (
                     device_id,
                     date_str,
@@ -252,7 +255,32 @@ class IoTConsumer:
                 )
             )
         except Exception as e:
-            logger.warning(f"Failed to write anomaly_event for {device_id}@{snapshot_time}: {e}")
+            logger.warning(f"Anomaly event insert with flags failed, retrying minimal insert: {e}")
+            # Minimal insert compatible with original schema
+            try:
+                insert_min = """
+                    INSERT INTO anomaly_events
+                    (device_id, date, anomaly_id, device_type, detected_at, snapshot_time,
+                     anomaly_score, anomaly_type, metrics_snapshot, resolution_status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                self.scylla_session.execute(
+                    insert_min,
+                    (
+                        device_id,
+                        date_str,
+                        uuid.uuid1(),
+                        device_type,
+                        snapshot_time,
+                        snapshot_time,
+                        float(result.anomaly_score),
+                        'consumer_paths_1_2',
+                        metrics_snapshot,
+                        'open'
+                    )
+                )
+            except Exception as e2:
+                logger.error(f"Failed to write anomaly_event (fallback) for {device_id}@{snapshot_time}: {e2}")
     
     def _get_window_start(self, timestamp: datetime) -> datetime:
         """Get the start of the aggregation window for a timestamp."""

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 # Detection thresholds
 OUTLIER_SIGMA_THRESHOLD = 6.0  # Z-score for Path 1
 OUTLIER_COUNT_THRESHOLD = 4    # Min outliers for Path 1
-PROFILE_SIMILARITY_THRESHOLD = 0.90  # Cosine similarity for Path 2
+PROFILE_SIMILARITY_THRESHOLD = 0.93  # Cosine similarity for Path 2
 PATH3_MIN_MATCHES = 7          # Min similar snapshots for Path 3
 PATH3_SIMILARITY_THRESHOLD = 0.90  # Similarity threshold for Path 3
 

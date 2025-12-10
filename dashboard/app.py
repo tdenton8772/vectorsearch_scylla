@@ -187,29 +187,31 @@ def format_metric_value(value):
 def create_device_card(device: Dict):
     """Create a card component for a device."""
     # Determine status color
-    if device['is_anomalous']:
-        status_color = '#e74c3c'  # Red
-        status_text = '⚠️ Anomalous'
-    else:
-        status_color = '#27ae60'  # Green
-        status_text = '✓ Normal'
-    
-    # Time since last update
+    is_anom = bool(device.get('is_anomalous'))
+    status_color = '#e74c3c' if is_anom else '#27ae60'
+    status_text = '⚠️ Anomalous' if is_anom else '✓ Normal'
+
+    # Last update text and fallback when no data yet
     now = datetime.now(timezone.utc)
-    snapshot_time = device['snapshot_time']
-    if snapshot_time.tzinfo is None:
-        snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
-    time_diff = (now - snapshot_time).total_seconds()
-    
-    if time_diff < 60:
-        last_update = f"{int(time_diff)}s ago"
-    elif time_diff < 3600:
-        last_update = f"{int(time_diff / 60)}m ago"
+    snapshot_time = device.get('snapshot_time')
+    if snapshot_time is None:
+        last_update = 'no data yet'
+        # Visually gray out when there is no data
+        status_color = '#bdc3c7'
+        status_text = '⏳ No data yet'
     else:
-        last_update = f"{int(time_diff / 3600)}h ago"
-    
+        if getattr(snapshot_time, 'tzinfo', None) is None:
+            snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
+        age_seconds = max(0, int((now - snapshot_time).total_seconds()))
+        if age_seconds < 60:
+            last_update = f"{age_seconds}s ago"
+        elif age_seconds < 3600:
+            last_update = f"{age_seconds // 60}m ago"
+        else:
+            last_update = snapshot_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+
     # Get key metrics based on device type
-    metrics = device['metrics']
+    metrics = device.get('metrics') or {}
     key_metrics = []
     
     # Show first 6 most important metrics
@@ -317,7 +319,7 @@ def create_device_card(device: Dict):
         'padding': '20px',
         'borderRadius': '8px',
         'boxShadow': '0 2px 4px rgba(0,0,0,0.1)',
-        'border': f'2px solid {status_color}' if device['is_anomalous'] else '1px solid #ddd',
+'border': f'2px solid {status_color}' if is_anom else '1px solid #ddd',
         'cursor': 'pointer'
     })
 

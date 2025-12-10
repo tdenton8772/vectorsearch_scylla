@@ -4,7 +4,8 @@
       "device_id": "RTU-001",
       "device_type": "rooftop_unit",
       "location": "building-A",
-      "building_id": "bldg-001"
+      "building_id": "bldg-001",
+      "inject_anomalies": true
     },
     {
       "device_id": "RTU-002",

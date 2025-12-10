@@ -32,9 +32,10 @@ scylla_password = os.getenv('SCYLLA_PASSWORD')
 scylla_keyspace = os.getenv('SCYLLA_KEYSPACE', 'iot_monitoring')
 
 # Path 3 thresholds
-PATH3_MIN_MATCHES = 5
-PATH3_SIMILARITY_THRESHOLD = 0.90
+PATH3_MIN_MATCHES = 7
+PATH3_SIMILARITY_THRESHOLD = 0.85
 POLL_INTERVAL = 10  # seconds
+ANN_LIMIT = 10  # Only fetch top 10 neighbors
 
 # Warmup guard: require enough recent snapshots before judging anomalies
 WARMUP_MIN_TOTAL = 30
@@ -114,12 +115,12 @@ def run_vector_search_path3(
     cutoff_time = snapshot.snapshot_time - timedelta(days=1)
     
     try:
-        # ANN query: Get top 100 nearest neighbors
+        # ANN query: Get top 10 nearest neighbors
         ann_query = """
             SELECT device_id, snapshot_time, embedding, is_anomalous
             FROM device_state_snapshots
             ORDER BY embedding ANN OF %s
-            LIMIT 100
+            LIMIT 10
         """
         import time
         ann_start = time.time()
@@ -300,14 +301,15 @@ def main():
     print(f"🔍 Monitoring {len(device_ids)} device(s): {', '.join(device_ids)}")
     
     # Initialize watermark
-    persisted = load_watermark()
+    persisted = None if globals().get('_WM_RESET') else load_watermark()
     if persisted is not None:
         last_processed = persisted
         print(f"\n🕐 Watermark loaded: {last_processed.isoformat()}")
     else:
-        # No prior state → look back 5 minutes
-        last_processed = datetime.now(timezone.utc) - timedelta(minutes=5)
-        print(f"\n🕐 Watermark initialized (5m lookback): {last_processed.isoformat()}")
+        # No prior state or reset requested → look back N minutes
+        lookback_min = int(globals().get('_WM_LOOKBACK_MIN', 5))
+        last_processed = datetime.now(timezone.utc) - timedelta(minutes=lookback_min)
+        print(f"\n🕐 Watermark initialized ({lookback_min}m lookback): {last_processed.isoformat()}")
     print("\n🔄 Polling for new snapshots...\n")
     
     try:
@@ -368,4 +370,28 @@ def main():
 
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Path 3 Vector Search detector')
+    parser.add_argument('--warmup-min-total', type=int, default=WARMUP_MIN_TOTAL, help='Min recent snapshots before judging anomalies')
+    parser.add_argument('--warmup-hours', type=int, default=WARMUP_LOOKBACK_HOURS, help='Lookback hours for warmup count')
+    parser.add_argument('--watermark-lookback-minutes', type=int, default=5, help='Initial lookback minutes if no persisted watermark or when resetting')
+    parser.add_argument('--reset-watermark', action='store_true', help='Ignore persisted watermark and reinitialize')
+    args = parser.parse_args()
+
+    # Override module-level warmup thresholds
+    WARMUP_MIN_TOTAL = args.warmup_min_total
+    WARMUP_LOOKBACK_HOURS = args.warmup_hours
+
+    # Stash initial watermark/lookback and reset flag at module scope
+    _WM_LOOKBACK_MIN = args.watermark_lookback_minutes
+    _WM_RESET = args.reset_watermark
+
+    # Expose to main via globals
+    globals().update(
+        WARMUP_MIN_TOTAL=WARMUP_MIN_TOTAL,
+        WARMUP_LOOKBACK_HOURS=WARMUP_LOOKBACK_HOURS,
+        _WM_LOOKBACK_MIN=_WM_LOOKBACK_MIN,
+        _WM_RESET=_WM_RESET,
+    )
+
     main()

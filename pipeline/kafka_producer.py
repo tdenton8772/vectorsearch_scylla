@@ -262,12 +262,14 @@ def main():
         logger.info(f"Loading fleet config from {args.fleet_config}")
         devices = load_fleet_config(args.fleet_config)
         for device in devices:
+            # Check both config file and CLI args for anomaly injection
+            inject_anomalies = device.get('inject_anomalies', False) or (device['device_id'] in args.anomaly_devices)
             producer.add_device(
                 device_id=device['device_id'],
                 device_type=device['device_type'],
                 location=device.get('location', 'building-A'),
                 building_id=device.get('building_id', 'bldg-001'),
-                inject_anomalies=device['device_id'] in args.anomaly_devices
+                inject_anomalies=inject_anomalies
             )
     else:
         for device_spec in args.devices:
